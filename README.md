@@ -2,6 +2,8 @@
 
 > WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
 
+> **Fork 说明**：本仓库 fork 自上游 [`Sliverkiss/workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)，核心反代、账号池、调度逻辑均来自上游；本地 `local-admin` 分支在此基础上叠加自用改动（会话粘性增强 + 内嵌 Web 控制台），详见下文「本地改动」一节。上游更新可用 `git fetch upstream && git rebase upstream/master` 跟进。
+
 ## 功能特性
 
 - 🔐 **OAuth 登录** — 通过 `/v2/plugin/auth/state` 设备授权流程获取凭证，支持 token 自动刷新
@@ -21,7 +23,7 @@
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/JeffHu0912/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，设置 api_key
@@ -187,6 +189,22 @@ Disabled ←────┘ (session 死亡，永久)
 | `GET /v1/models` | Bearer | 模型列表（动态拉取 + 静态兜底） |
 | `GET /status` | Bearer | 账号状态汇总（total/healthy/cooling/disabled + 每账号详情） |
 | `GET /healthz` | 无 | 健康检查（无健康账号时 503） |
+| `GET /admin` | 无 | Web 控制台（本地自用改动，见下） |
+| `GET /admin/api/credits` | 无 | 并发拉取上游实时额度（本地自用改动） |
+| `GET /admin/api/accounts` | 无 | 账号池运行态画像（本地自用改动） |
+| `POST /admin/api/accounts/{uid}/cooldown` | Bearer | 手工解除单账号冷却+熔断（本地自用改动） |
+| `POST /admin/api/checkin` | Bearer | 手工触发全账号签到+余额探测（本地自用改动） |
+
+## 本地改动（`local-admin` 分支，相对上游）
+
+### 1. 会话粘性增强（`internal/session`）
+- `ExtractKey` 新增 `user` 字段兜底 + 首轮 messages 指纹（`fp:<sha256[:8]>`），无显式会话 id 的多轮对话也能固定到同一账号；
+- 新增 `ExtractKeyFromRequest`，优先从 `X-Session-ID` / `X-Conversation-ID` / `Session-Id` 请求头取键，回退请求体。
+
+### 2. 内嵌 Web 控制台（`internal/server/admin.*`）
+- `GET /admin`：深色单文件控制台——汇总条（总数/健康/冷却/禁用/在途/粘性会话）+ 实时额度卡片 + 详细运行态表；
+- `pool.ResetCooldown`：手工清零单账号即时冷却、熔断器与失败计数；
+- `POST /admin/api/checkin`：并发触发全部账号每日签到并按余额解冻。
 
 ## 稳定性设计
 
