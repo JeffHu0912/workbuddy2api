@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy2API 控制台</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --dim:#8a93a6;
+          --ok:#3fb96b; --warn:#e0a33e; --bad:#e05d5d; --accent:#4d9fff; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; min-height:100vh; }
+  .wrap { max-width:1100px; margin:0 auto; padding:28px 20px 60px; }
+  header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:18px; }
+  h1 { font-size:22px; font-weight:600; letter-spacing:.3px; }
+  h1 small { color:var(--dim); font-weight:400; font-size:13px; margin-left:8px; }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .btn { background:var(--card2); color:var(--fg); border:1px solid #2a2f3a; border-radius:8px;
+         padding:8px 16px; font-size:13px; cursor:pointer; transition:.15s; }
+  .btn:hover { border-color:var(--accent); color:var(--accent); }
+  .btn.primary { background:#1c3a5a; border-color:var(--accent); color:var(--accent); }
+  .btn.danger { border-color:#5a2a2a; }
+  .btn.danger:hover { color:var(--bad); border-color:var(--bad); }
+  .btn.sm { padding:4px 10px; font-size:12px; }
+  #ts { color:var(--dim); font-size:12px; }
+  /* key bar */
+  .keybar { display:flex; gap:8px; align-items:center; margin-bottom:16px; font-size:12px; color:var(--dim); flex-wrap:wrap; }
+  .keybar input { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
+                  padding:5px 10px; font-size:12px; width:220px; font-family:Consolas,monospace; }
+  .keybar .saved { color:var(--ok); font-size:11px; }
+  /* metrics summary bar */
+  .summary-bar { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:20px; }
+  .sum-card { background:var(--card); border:1px solid #232836; border-radius:10px; padding:12px 14px; text-align:center; }
+  .sum-card .label { font-size:11px; color:var(--dim); margin-bottom:4px; }
+  .sum-card .val { font-size:20px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .sum-card.ok .val { color:var(--ok); }
+  .sum-card.warn .val { color:var(--warn); }
+  .sum-card.bad .val { color:var(--bad); }
+  /* tabs */
+  .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid #232836; }
+  .tab { padding:8px 16px; font-size:13px; cursor:pointer; color:var(--dim); border-bottom:2px solid transparent; }
+  .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .pane { display:none; }
+  .pane.active { display:block; }
+  /* credits grid */
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid #232836; border-radius:12px; padding:18px 18px 14px; position:relative; }
+  .card.err { border-color:var(--bad); }
+  .card.cooling { border-color:var(--warn); }
+  .card-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .nick { font-size:15px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .uid { color:var(--dim); font-size:11px; margin-top:2px; font-family:Consolas,monospace; cursor:pointer; }
+  .uid:hover { color:var(--accent); }
+  .badges { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+  .badge { font-size:11px; padding:3px 9px; border-radius:99px; white-space:nowrap; }
+  .b-ok   { background:#173a26; color:var(--ok); }
+  .b-warn { background:#3a2d13; color:var(--warn); }
+  .b-bad  { background:#3a1717; color:var(--bad); }
+  .b-dim  { background:#22262f; color:var(--dim); }
+  .credits { margin:16px 0 14px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
+  .remain { font-size:32px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .remain span { font-size:13px; color:var(--dim); font-weight:400; margin-left:4px; }
+  .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; margin-bottom:12px; }
+  .meta b { color:var(--fg); font-weight:600; }
+  .errline { margin-top:8px; color:var(--bad); font-size:11px; word-break:break-all; }
+  .card-actions { display:flex; gap:8px; justify-content:flex-end; border-top:1px solid #232836; padding-top:10px; margin-top:6px; }
+  /* table */
+  table.accts { width:100%; border-collapse:collapse; font-size:13px; }
+  table.accts th, table.accts td { text-align:left; padding:10px 12px; border-bottom:1px solid #232836; }
+  table.accts th { color:var(--dim); font-weight:500; font-size:12px; }
+  table.accts tr:hover td { background:var(--card2); }
+  table.accts .mono { font-family:Consolas,monospace; font-size:11px; color:var(--dim); }
+  .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--card2); border-top-color:var(--accent);
+          border-radius:50%; animation:sp .8s linear infinite; vertical-align:-2px; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>WorkBuddy2API 控制台<small>腾讯 CodeBuddy 算力池 · 实时监控</small></h1>
+    <div class="toolbar">
+      <span id="ts"></span>
+      <button class="btn" onclick="loadCredits(true)">测额刷新</button>
+      <button class="btn primary" onclick="triggerCheckin()">一键签到</button>
+    </div>
+  </header>
+
+  <div class="keybar">
+    <span>API Key：</span>
+    <input id="apikey" type="password" placeholder="wb2a_xxx (重置/管理操作需)" oninput="onKeyChange()">
+    <button class="btn sm" onclick="saveKey()">保存</button>
+    <span id="keystatus" class="saved" style="display:none">已记忆</span>
+    <span style="margin-left:auto;font-size:11px">状态监控开放只读；解冻与配置需 Key</span>
+  </div>
+
+  <div class="summary-bar" id="summaryBar">
+    <div class="sum-card"><div class="label">总账号数</div><div class="val" id="sumTotal">-</div></div>
+    <div class="sum-card ok"><div class="label">健康可用</div><div class="val" id="sumHealthy">-</div></div>
+    <div class="sum-card warn"><div class="label">冷却中</div><div class="val" id="sumCooling">-</div></div>
+    <div class="sum-card bad"><div class="label">已禁用</div><div class="val" id="sumDisabled">-</div></div>
+    <div class="sum-card"><div class="label">在途活跃请求</div><div class="val" id="sumInFlight">-</div></div>
+    <div class="sum-card"><div class="label">粘性会话数</div><div class="val" id="sumSticky">-</div></div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('cards',this)">实时卡片看板</div>
+    <div class="tab" onclick="switchTab('table',this)">详细运行态列表</div>
+  </div>
+
+  <!-- 卡片看板 -->
+  <div id="pane-cards" class="pane active">
+    <div class="grid" id="cardsGrid">
+      <div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--dim)">正在加载账号池...</div>
+    </div>
+  </div>
+
+  <!-- 详细列表 -->
+  <div id="pane-table" class="pane">
+    <table class="accts">
+      <thead>
+        <tr>
+          <th>UID / 昵称</th>
+          <th>可用额度</th>
+          <th>状态</th>
+          <th>在途并发</th>
+          <th>成功/失败</th>
+          <th>冷却截止 / 原因</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody">
+        <tr><td colspan="7" style="text-align:center;color:var(--dim)">加载中...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  let curTab = 'cards';
+  let accountsData = [];
+
+  function getKey() {
+    return localStorage.getItem('wb2a_api_key') || document.getElementById('apikey').value.trim();
+  }
+  function saveKey() {
+    const k = document.getElementById('apikey').value.trim();
+    if(k) { localStorage.setItem('wb2a_api_key', k); }
+    else { localStorage.removeItem('wb2a_api_key'); }
+    const ks = document.getElementById('keystatus');
+    ks.style.display = 'inline';
+    setTimeout(() => { ks.style.display = 'none'; }, 2000);
+  }
+  function onKeyChange() {
+    // optional autosave
+  }
+
+  function authHeaders() {
+    const k = getKey();
+    const h = {'Accept': 'application/json'};
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    return h;
+  }
+
+  function switchTab(t, el) {
+    curTab = t;
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(x => x.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('pane-' + t).classList.add('active');
+  }
+
+  async function loadStatusOverview() {
+    try {
+      const res = await fetch('/status', { headers: authHeaders() });
+      if (!res.ok) return;
+      const d = await res.json();
+      document.getElementById('sumTotal').textContent = d.total || 0;
+      document.getElementById('sumHealthy').textContent = d.healthy || 0;
+      document.getElementById('sumCooling').textContent = d.cooling || 0;
+      document.getElementById('sumDisabled').textContent = d.disabled || 0;
+      document.getElementById('sumInFlight').textContent = d.in_flight_full || 0;
+      document.getElementById('sumSticky').textContent = d.sticky_sessions || 0;
+      if (d.accounts) {
+        accountsData = d.accounts;
+        renderTable(d.accounts);
+      }
+    } catch(e) {}
+  }
+
+  async function loadCredits(force) {
+    const grid = document.getElementById('cardsGrid');
+    if (force) {
+      grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--dim)"><span class="spin"></span> 正在并发拉取腾讯上游实时额度...</div>';
+    }
+    try {
+      const res = await fetch('/admin/api/credits', { headers: authHeaders() });
+      if (!res.ok) {
+        grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--bad)">拉取失败 (HTTP ' + res.status + ')</div>';
+        return;
+      }
+      const data = await res.json();
+      document.getElementById('ts').textContent = '更新于 ' + (data.fetched_at || new Date().toLocaleTimeString());
+      renderCards(data.accounts || []);
+      loadStatusOverview();
+    } catch(e) {
+      grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--bad)">网络异常: ' + e.message + '</div>';
+    }
+  }
+
+  function renderCards(list) {
+    const grid = document.getElementById('cardsGrid');
+    if (!list.length) {
+      grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--dim)">无账号，请检查 auths/ 目录</div>';
+      return;
+    }
+    let html = '';
+    list.forEach(a => {
+      let badge = '<span class="badge b-ok">可用</span>';
+      let cardCls = 'card';
+      if (a.disabled) {
+        badge = '<span class="badge b-bad">已禁用</span>';
+        cardCls += ' err';
+      } else if (a.cooling) {
+        badge = '<span class="badge b-warn">冷却中</span>';
+        cardCls += ' cooling';
+      }
+
+      const uidShort = (a.uid && a.uid.length > 8) ? a.uid.substring(0, 8) : (a.uid || '-');
+      const nick = a.nickname || 'WorkBuddy 用户';
+      const remain = (a.remain !== undefined) ? a.remain.toLocaleString() : '-';
+
+      html += `
+        <div class="${cardCls}">
+          <div class="card-top">
+            <div>
+              <div class="nick" title="${nick}">${nick}</div>
+              <div class="uid" title="点击复制完整 UID: ${a.uid}" onclick="copyTxt('${a.uid}')">UID: ${uidShort}...</div>
+            </div>
+            <div class="badges">${badge}</div>
+          </div>
+          <div class="credits">
+            <div class="remain">${remain}<span>算力点</span></div>
+          </div>
+          <div class="meta">
+            <div>并发在途: <b>${a.in_flight || 0}</b></div>
+            <div>成功: <b>${a.success_count || 0}</b></div>
+            <div>错误: <b>${a.err_total || 0}</b></div>
+          </div>
+          ${a.reason ? `<div class="errline">⚠️ 原因: ${a.reason}</div>` : ''}
+          ${a.error ? `<div class="errline">⚠️ 探测报错: ${a.error}</div>` : ''}
+          <div class="card-actions">
+            ${a.cooling ? `<button class="btn sm danger" onclick="resetCooldown('${a.uid}')">解除冷却</button>` : ''}
+          </div>
+        </div>
+      `;
+    });
+    grid.innerHTML = html;
+  }
+
+  function renderTable(list) {
+    const tbody = document.getElementById('tableBody');
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--dim)">无数据</td></tr>';
+      return;
+    }
+    let html = '';
+    list.forEach(a => {
+      const uidShort = (a.uid && a.uid.length > 8) ? a.uid.substring(0, 8) : a.uid;
+      let statusBadge = '<span class="badge b-ok">healthy</span>';
+      if (a.disabled) statusBadge = '<span class="badge b-bad">disabled</span>';
+      else if (a.cooling) statusBadge = '<span class="badge b-warn">cooling</span>';
+
+      html += `
+        <tr>
+          <td>
+            <b>${a.nickname || '未命名'}</b><br>
+            <span class="mono">${uidShort}...</span>
+          </td>
+          <td><b>${(a.credits || 0).toLocaleString()}</b></td>
+          <td>${statusBadge}</td>
+          <td>${a.in_flight || 0}</td>
+          <td>${a.success_count || 0} / ${a.err_total || 0}</td>
+          <td class="mono">${a.until && a.until.startsWith('0001') ? '-' : (a.until ? a.until.substring(11,19) : '-')} ${a.reason ? '('+a.reason+')' : ''}</td>
+          <td>
+            ${a.cooling ? `<button class="btn sm danger" onclick="resetCooldown('${a.uid}')">解除冷却</button>` : `<span style="color:var(--dim)">-</span>`}
+          </td>
+        </tr>
+      `;
+    });
+    tbody.innerHTML = html;
+  }
+
+  async function resetCooldown(uid) {
+    if (!confirm('确认解除该账号的冷却与熔断状态？')) return;
+    try {
+      const res = await fetch('/admin/api/accounts/' + uid + '/cooldown', {
+        method: 'POST',
+        headers: authHeaders()
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert('操作失败: ' + (d.message || res.statusText));
+        return;
+      }
+      loadCredits(false);
+    } catch(e) {
+      alert('请求异常: ' + e.message);
+    }
+  }
+
+  async function triggerCheckin() {
+    if (!confirm('立即对全部账号执行每日签到与余额探测？')) return;
+    try {
+      const res = await fetch('/admin/api/checkin', {
+        method: 'POST',
+        headers: authHeaders()
+      });
+      if (res.ok) {
+        alert('签到已触发完成！');
+        loadCredits(false);
+      } else {
+        alert('签到失败 (HTTP ' + res.status + ')');
+      }
+    } catch(e) {
+      alert('网络异常: ' + e.message);
+    }
+  }
+
+  function copyTxt(txt) {
+    navigator.clipboard.writeText(txt).then(() => {
+      alert('已复制 UID 到剪贴板: ' + txt);
+    }).catch(() => {
+      prompt('请手动复制 UID:', txt);
+    });
+  }
+
+  // 初始化
+  window.addEventListener('DOMContentLoaded', () => {
+    const saved = localStorage.getItem('wb2a_api_key');
+    if (saved) document.getElementById('apikey').value = saved;
+    loadCredits(false);
+  });
+</script>
+</body>
+</html>

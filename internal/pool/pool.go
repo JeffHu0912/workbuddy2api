@@ -750,6 +750,24 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
+// ResetCooldown 手工解除账号的即时冷却与熔断状态，重置错误计数器。
+func (p *Pool) ResetCooldown(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.breakerUntil = time.Time{}
+	e.fails = 0
+	e.retryCount = 0
+	p.dirty.Store(true)
+	return true
+}
+
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。
 // 达到 breakerThreshold 触发熔断（指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
