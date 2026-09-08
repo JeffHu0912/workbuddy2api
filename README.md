@@ -1,5 +1,7 @@
 # WorkBuddy2API
 
+> **借鉴说明**：本项目基于上游 [`Sliverkiss/workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 持续迭代，含调度策略、健康检查与稳定性修复等改进。
+
 > WorkBuddy CN（CodeBuddy / copilot.tencent.com）的 OpenAI 兼容反向代理，支持 OAuth 登录、多账号轮转、工具调用与流式响应。
 
 ## 功能特性
@@ -21,7 +23,7 @@
 ### 1. 克隆 & 配置
 
 ```bash
-git clone https://github.com/Sliverkiss/workbuddy2api.git
+git clone https://github.com/JeffHu0912/workbuddy2api.git
 cd workbuddy2api
 cp config.example.json config.json
 # 编辑 config.json，设置 api_key
@@ -231,4 +233,4 @@ internal/
 
 ## License
 
-MIT
+MIT — 详见 [LICENSE](./LICENSE)。
