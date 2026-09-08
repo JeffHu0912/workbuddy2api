@@ -10,8 +10,12 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -269,10 +273,12 @@ func hashIndex(key string, n int) int {
 	return int(h % uint32(n))
 }
 
-// ExtractKey 从请求体提取会话键；按任务书给定顺序依次尝试，找不到返回空串（绝不失败）。
+// ExtractKey 从请求体提取会话键；按顺序依次尝试，找不到返回空串（绝不失败）：
 //  1. metadata.conversation_id
 //  2. conversation_id
 //  3. metadata.user_id
+//  4. user（OpenAI 标准字段）
+//  5. messages 首轮特征指纹（系统提示词 + 首条非系统提问的 SHA-256，多轮对话恒定）
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -289,7 +295,77 @@ func ExtractKey(body []byte) string {
 			return v
 		}
 	}
-	return strOrEmpty(obj["conversation_id"])
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["user"]); v != "" {
+		return v
+	}
+
+	// 提取 messages 数组特征指纹（多轮对话中恒定匹配）
+	if msgs, ok := obj["messages"].([]any); ok && len(msgs) > 0 {
+		h := sha256.New()
+		hasContent := false
+		if first, ok := msgs[0].(map[string]any); ok {
+			if strOrEmpty(first["role"]) == "system" {
+				if c := contentString(first["content"]); c != "" {
+					h.Write([]byte("sys:" + c))
+					hasContent = true
+				}
+			}
+		}
+		for _, m := range msgs {
+			if mm, ok := m.(map[string]any); ok {
+				role := strOrEmpty(mm["role"])
+				if role != "system" {
+					if c := contentString(mm["content"]); c != "" {
+						h.Write([]byte(role + ":" + c))
+						hasContent = true
+						break
+					}
+				}
+			}
+		}
+		if hasContent {
+			return "fp:" + hex.EncodeToString(h.Sum(nil)[:8])
+		}
+	}
+
+	return ""
+}
+
+// ExtractKeyFromRequest 优先从 HTTP 请求头提取会话键，若无则回退解析请求体。
+func ExtractKeyFromRequest(r *http.Request, body []byte) string {
+	if r != nil {
+		if v := r.Header.Get("X-Session-ID"); v != "" {
+			return v
+		}
+		if v := r.Header.Get("X-Conversation-ID"); v != "" {
+			return v
+		}
+		if v := r.Header.Get("Session-Id"); v != "" {
+			return v
+		}
+	}
+	return ExtractKey(body)
+}
+
+func contentString(v any) string {
+	switch cv := v.(type) {
+	case string:
+		return cv
+	case []any:
+		var sb strings.Builder
+		for _, part := range cv {
+			if pm, ok := part.(map[string]any); ok {
+				if strOrEmpty(pm["type"]) == "text" {
+					sb.WriteString(strOrEmpty(pm["text"]))
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。

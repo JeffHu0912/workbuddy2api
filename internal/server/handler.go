@@ -55,6 +55,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	h.mux.HandleFunc("GET /admin", h.adminPage)
+	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
+	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/cooldown", h.withAuth(h.adminResetCooldown))
+	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
 	return h
 }
 
@@ -221,11 +226,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]bool{}
 	var lastErr error
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+	// 会话粘性：从请求头/请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
 	stickyUID := ""
 	if h.cfg.Session != nil {
-		sessKey = session.ExtractKey(body)
+		sessKey = session.ExtractKeyFromRequest(r, body)
 		if sessKey != "" {
 			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
 				stickyUID = uid

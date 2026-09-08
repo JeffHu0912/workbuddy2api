@@ -1,5 +1,6 @@
 # Auth & secrets
 auths/
+auths-reserve/
 data/
 *.key
 *.pem

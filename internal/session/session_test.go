@@ -1,6 +1,8 @@
 package session
 
 import (
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +118,7 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
 		{`{"metadata":{"user_id":"mu"}}`, "mu"},                                                // metadata.user_id 兜底
+		{`{"user":"usr-123"}`, "usr-123"},                                                      // user 兜底
 		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 	}
@@ -123,6 +126,39 @@ func TestExtractKeyPriority(t *testing.T) {
 		if got := ExtractKey([]byte(c.body)); got != c.want {
 			t.Errorf("ExtractKey(%s)=%q want %q", c.body, got, c.want)
 		}
+	}
+}
+
+func TestExtractKeyMessagesFingerprint(t *testing.T) {
+	turn1 := `{"model":"glm-5.2","messages":[{"role":"user","content":"hello world"}]}`
+	turn2 := `{"model":"glm-5.2","messages":[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi"},{"role":"user","content":"tell me a joke"}]}`
+
+	fp1 := ExtractKey([]byte(turn1))
+	fp2 := ExtractKey([]byte(turn2))
+
+	if !strings.HasPrefix(fp1, "fp:") {
+		t.Fatalf("expected fingerprint prefix, got %q", fp1)
+	}
+	if fp1 != fp2 {
+		t.Fatalf("fingerprint should be identical across turns, got %q vs %q", fp1, fp2)
+	}
+
+	// 包含系统提示词的多轮
+	sysTurn1 := `{"messages":[{"role":"system","content":"you are bot"},{"role":"user","content":"ping"}]}`
+	sysTurn2 := `{"messages":[{"role":"system","content":"you are bot"},{"role":"user","content":"ping"},{"role":"assistant","content":"pong"},{"role":"user","content":"next"}]}`
+	sysFp1 := ExtractKey([]byte(sysTurn1))
+	sysFp2 := ExtractKey([]byte(sysTurn2))
+
+	if sysFp1 != sysFp2 {
+		t.Fatalf("system fingerprint should match across turns, got %q vs %q", sysFp1, sysFp2)
+	}
+}
+
+func TestExtractKeyFromRequest(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Session-ID", "custom-header-sid")
+	if got := ExtractKeyFromRequest(req, nil); got != "custom-header-sid" {
+		t.Fatalf("expected custom-header-sid from header, got %q", got)
 	}
 }
 
