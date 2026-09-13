@@ -114,17 +114,25 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 }
 
 // 静态 CN 模型表（api-reference §5，动态接口失败时的回退）。
+// 与上游 /console/enterprises/personal/models 对齐（2026-09-10 快照，15 个）：
+// 移除已下线的 hy3-preview / hy3-preview-agent，补齐 auto / hy4-preview / hy3-x /
+// glm-5.3 / glm-5.3-flash / kimi-k3-1 / kimi-k2.6，并按上游修正 context/maxTokens。
 var staticModels = []map[string]any{
-	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "hy3-preview-agent", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
-	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
+	{"id": "auto", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 168000, "max_output_tokens": 32000},
+	{"id": "hy4-preview", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 64000},
+	{"id": "hy3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000, "max_output_tokens": 64000},
+	{"id": "hy3-x", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 192000, "max_output_tokens": 64000},
+	{"id": "glm-5.3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 48000},
+	{"id": "glm-5.3-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 32000},
+	{"id": "glm-5.2", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 48000},
+	{"id": "glm-5.1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000, "max_output_tokens": 48000},
+	{"id": "glm-5v-turbo", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 200000, "max_output_tokens": 64000},
+	{"id": "kimi-k3-1", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 32000},
+	{"id": "kimi-k2.7", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000, "max_output_tokens": 32000},
+	{"id": "kimi-k2.6", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 256000, "max_output_tokens": 32000},
+	{"id": "minimax-m3", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 512000, "max_output_tokens": 128000},
+	{"id": "deepseek-v4.1-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 128000},
+	{"id": "deepseek-v4-pro", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 1000000, "max_output_tokens": 50000},
 }
 
 // dynamicModelsCache 动态模型缓存。
@@ -148,11 +156,25 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// modelBlocklist 屏蔽「上游仍在广播、但请求必失败」的模型。
+//
+// 上游 /console/enterprises/personal/models 仍会把它们列出来，实际请求却返回
+// 400 {"code":11102,"msg":"model [X] service info not found"}。网关若照抄列表，
+// 客户端选到该模型必然失败，故在此统一过滤（动态列表与静态回退都过一遍）。
+//
+// 2026-09-13 实测加入：kimi-k2.8-preview（HTTP 503 / 上游 11102 模型不存在）。
+var modelBlocklist = map[string]bool{
+	"kimi-k2.8-preview": true,
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
+			if modelBlocklist[mi.ID] {
+				continue
+			}
 			entry := map[string]any{
 				"id":                mi.ID,
 				"object":            "model",
@@ -168,7 +190,15 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	return staticModels
+	// 静态回退同样过滤，保持两条路径口径一致。
+	out := make([]map[string]any, 0, len(staticModels))
+	for _, m := range staticModels {
+		if id, _ := m["id"].(string); modelBlocklist[id] {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
