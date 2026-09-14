@@ -18,9 +18,6 @@ func TestParseNested(t *testing.T) {
 	if sa.UID != "u1" || sa.EnterpriseID != "e1" || sa.Nickname != "n1" {
 		t.Errorf("account: %+v", sa)
 	}
-	if sa.Region() != "cn" {
-		t.Errorf("region want cn, got %s", sa.Region())
-	}
 }
 
 func TestParseFlat(t *testing.T) {
@@ -34,21 +31,6 @@ func TestParseFlat(t *testing.T) {
 func TestParseMissingToken(t *testing.T) {
 	if _, err := Parse([]byte(`{"uid":"u3"}`)); err == nil {
 		t.Fatal("want error for missing accessToken")
-	}
-}
-
-func TestGlobalRegion(t *testing.T) {
-	for _, d := range []string{"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI"} {
-		sa := &Auth{Domain: d}
-		if sa.Region() != "global" {
-			t.Errorf("domain %q want global, got %s", d, sa.Region())
-		}
-	}
-	for _, d := range []string{"", "codebuddy.cn", "www.codebuddy.cn"} {
-		sa := &Auth{Domain: d}
-		if sa.Region() != "cn" {
-			t.Errorf("domain %q want cn, got %s", d, sa.Region())
-		}
 	}
 }
 
@@ -76,24 +58,28 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	}
 }
 
-func TestLoadDirFiltersRegion(t *testing.T) {
+// TestLoadDirLoadsAllValid 不再按 region 过滤：所有可解析的 auth 文件都被加载，
+// 解析失败的文件静默跳过。
+func TestLoadDirLoadsAllValid(t *testing.T) {
 	dir := t.TempDir()
 	cn := `{"auth":{"accessToken":"at1","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"cn1"}}`
-	gl := `{"auth":{"accessToken":"at2","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`
+	other := `{"auth":{"accessToken":"at2","refreshToken":"r","expiresAt":1,"domain":"example.com"},"account":{"uid":"u2"}}`
 	bad := `not json`
 	os.WriteFile(filepath.Join(dir, "workbuddy-cn1.json"), []byte(cn), 0o600)
-	os.WriteFile(filepath.Join(dir, "workbuddy-g1.json"), []byte(gl), 0o600)
+	os.WriteFile(filepath.Join(dir, "workbuddy-u2.json"), []byte(other), 0o600)
 	os.WriteFile(filepath.Join(dir, "workbuddy-bad.json"), []byte(bad), 0o600)
 
-	list, err := LoadDir(dir, "cn")
+	list, err := LoadDir(dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if len(list) != 1 || list[0].UID != "cn1" {
-		t.Fatalf("want 1 cn account, got %+v", list)
+	if len(list) != 2 {
+		t.Fatalf("want 2 valid accounts, got %+v", list)
 	}
-	if list[0].FilePath == "" {
-		t.Error("FilePath not set")
+	for _, a := range list {
+		if a.FilePath == "" {
+			t.Error("FilePath not set")
+		}
 	}
 }
 
@@ -105,5 +91,48 @@ func TestNeedsRefresh(t *testing.T) {
 	a.ExpiresAt = 9999999999
 	if a.NeedsRefresh(0) {
 		t.Error("far future should not need refresh")
+	}
+}
+
+// TestParseDeviceToken 嵌套形与扁平形 auth 文件的顶层 device_token 键均被解析。
+func TestParseDeviceToken(t *testing.T) {
+	nested := []byte(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"u1"},"device_token":"dev-tok-nested"}`)
+	sa, err := Parse(nested)
+	if err != nil {
+		t.Fatalf("nested parse: %v", err)
+	}
+	if sa.DeviceToken != "dev-tok-nested" {
+		t.Errorf("nested DeviceToken = %q want %q", sa.DeviceToken, "dev-tok-nested")
+	}
+
+	flat := []byte(`{"accessToken":"at","refreshToken":"rt","expiresAt":1,"uid":"u2","device_token":"dev-tok-flat"}`)
+	fa, err := Parse(flat)
+	if err != nil {
+		t.Fatalf("flat parse: %v", err)
+	}
+	if fa.DeviceToken != "dev-tok-flat" {
+		t.Errorf("flat DeviceToken = %q want %q", fa.DeviceToken, "dev-tok-flat")
+	}
+}
+
+// TestSaveAtomicPreservesDeviceToken SaveAtomic 写回后顶层 device_token 被保留并重新解析回来。
+func TestSaveAtomicPreservesDeviceToken(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "workbuddy-dt.json")
+	a := &Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1,
+		UID: "u1", DeviceToken: "persisted-tok", FilePath: fp}
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	b, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	if b.DeviceToken != "persisted-tok" {
+		t.Errorf("roundtrip DeviceToken = %q want %q", b.DeviceToken, "persisted-tok")
 	}
 }

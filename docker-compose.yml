@@ -1,6 +1,21 @@
+# ✅ 本机运行 workbuddy2api（2026-09-12 曾迁 VPS，同日回迁本机）
+#
+# 现网：本机 Docker 容器 workbuddy2api，监听 0.0.0.0:7863
+#   → DSH(settings.yaml) 与 OmniRoute(provider_nodes.wb) 均指向 localhost/host.docker.internal:7863
+#
+# VPS 上仍保留一份（/opt/wb2api/），**当前处于停止状态**，作为回滚点。
+#   ⚠️ 切换前必须先停掉另一侧，再同步 auths/，否则两实例会并发刷新 refresh_token 导致账号失效。
+#   切换步骤见 ~/project/_wb2api-backup-rollback-*/MIGRATION-NOTES.md
+#
+# 查看 VPS 侧状态：
+#   ssh -i ~/.ssh/id_ed25519_dsh -p 36327 root@103.236.91.136 \
+#       'cd /opt/wb2api && docker compose ps'
+# ------------------------------------------------------------------------------
 services:
   wb2api:
     build: .
+    # 固定镜像名：与手工 `docker run` 时代保持一致，避免出现 project-* / *-wb2api 两份镜像。
+    image: project-workbuddy2api
     container_name: workbuddy2api
     restart: unless-stopped
     environment:
@@ -9,5 +24,16 @@ services:
       - "7863:7863"
     volumes:
       - ./auths:/app/auths
+      # data 保持 bind mount（本地映射，与旧版本一致）。
+      # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
+      #   chown -R 10001:10001 ./data
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+    # 声明外部网络：与既有容器拓扑一致（trae2api 亦在此网络）。
+    # 若改为 compose 默认网络，会导致容器重建后网络归属漂移。
+    networks:
+      - ai-mesh
+
+networks:
+  ai-mesh:
+    external: true

@@ -4,6 +4,9 @@ auths-reserve/
 data/
 *.key
 *.pem
+*.env
+.env
+.env.*
 
 # Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
 /login

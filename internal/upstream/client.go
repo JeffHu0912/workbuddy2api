@@ -4,29 +4,35 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
 type ErrKind int
 
 const (
-	ErrNone        ErrKind = iota // 成功
-	ErrHardCredit                 // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                   // 429 软限流 → 短冷却
-	ErrSessionDead                // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                     // 5xx 上游故障
-	ErrClient                     // 其他 4xx / 业务错误
+	ErrNone           ErrKind = iota // 成功
+	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                      // 429 软限流 → 短冷却
+	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                        // 5xx 上游故障
+	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+	ErrClient                        // 其他 4xx / 业务错误
 )
 
 func (k ErrKind) String() string {
@@ -41,6 +47,10 @@ func (k ErrKind) String() string {
 		return "not_found"
 	case ErrServer:
 		return "server"
+	case ErrContentBlocked:
+		return "content_blocked"
+	case ErrBadParams:
+		return "bad_params"
 	case ErrClient:
 		return "client"
 	default:
@@ -67,9 +77,113 @@ var hardMarkers = []string{
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
 }
 
+// softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
+// 上游在状态码非 429 时也会返回限流语义（如 200 + code 11140
+// "The model provider is rate-limiting requests."、400 + "rate limit"），
+// 此类响应若不识别，账号既不被冷却也不喂熔断，下次请求仍会被选中（issue #28）。
+//
+// 词表按子串匹配，宁缺毋滥：只收录明确指向「请求速率/模型用量被节流」的措辞。
+// 连字符形式（rate-limiting / rate-limited）需单列——Contains 不跨 '-'。
+// "too many" 会命中 "too many tokens" 这类客户端参数错误，代价是该号被软冷却
+// 一个 SoftCooldown（默认 60s）后自愈，远小于漏判限流导致反复选中同一号的代价。
+var softRateMarkers = []string{
+	"rate limit", // rate limit / rate limits / rate limiting
+	"rate-limiting",
+	"rate-limited",
+	"too many requests",
+	"too many",
+	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
+	"请求过于频繁", "限流",
+}
+
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
+//
+// 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
+// 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
+// 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
+// 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
+var contentBlockedMarkers = []string{
+	"blocked by security policy",
+	"unapproved channel",
+	"illegal api invocation",
+}
+
+// badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
+// "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
+// 与账号健康无关——不罚号，但仍轮转（commit B）。
+var badParamsMarkerMsg = "Unmarshal chat params failed"
+var badParamsMarkerCode = `"code":11101`
+
+// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
+// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
+var alreadyCheckinMarkers = []string{"已签到", "already"}
+
+// softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
+// 与容器时区无关）。
+var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+
+// SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
+func SoftRateResetLoc() *time.Location { return softRateResetLoc }
+
+// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
+// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
+// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
+const modelRateLimitCode = "6004"
+
+// softRateResetRe 匹配「将在 … 重置」，捕获中间的时间串。
+const softRateResetRe = `将在 (.+?) 重置`
+
+// softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
+const softRateTimeLayout = "2006-01-02 15:04:05"
+
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
+// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+func IsModelRateLimit(body string) bool {
+	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
+	re := regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	return re.MatchString(body)
+}
+
+// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
+// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
+// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
+func ParseSoftRateReset(body string) (time.Time, bool) {
+	if !IsModelRateLimit(body) {
+		return time.Time{}, false
+	}
+	re := regexp.MustCompile(softRateResetRe)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return time.Time{}, false
+	}
+	ts := strings.TrimSpace(m[1])
+	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
+	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
+//
+// 判定顺序自「严」到「宽」，每层的先后都有语义依据：
+//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
+//     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
+//     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
+//  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
+//     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
+//     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
+//     比限流层的大范围子串更具体，具体优先于宽泛。
+//  3. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时在此短路，
+//     结果同为 soft_rate，与下一层一致。
+//  4. status==429 —— body 无文案时的兜底识别。
+//  5. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
@@ -85,6 +199,11 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+	for _, m := range softRateMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrSoftRate
+		}
+	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -94,7 +213,22 @@ func Classify(status int, body string) ErrKind {
 	if status >= 500 {
 		return ErrServer
 	}
+	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
+	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
 	if status >= 400 {
+		for _, m := range contentBlockedMarkers {
+			if strings.Contains(lower, m) {
+				return ErrContentBlocked
+			}
+		}
+		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+		// 归 ErrBadParams：不冷却/不熔断/不计错，但**仍然轮转**（不同账号可能有不同的
+		// 模型权限，值得再试一次）。
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+			return ErrBadParams
+		}
 		return ErrClient
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
@@ -112,6 +246,16 @@ type apiEnvelope struct {
 type Client struct {
 	HTTP *http.Client
 
+	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
+	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
+	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
+	ChatHTTP *http.Client
+
+	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
+	HeaderTimeout time.Duration
+	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
+	IdleTimeout time.Duration
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
@@ -119,10 +263,47 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	ChatBaseCN      string
-	BillingBaseCN   string
-	ChatBaseGlobal  string
-	BillingBaseGlob string
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
+	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
+	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
+	// （仅当 client_name 非空，见 billingUA）。
+	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
+	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
+	// 用户仍可显式配置完全自定义的 UA。
+	UserAgent string
+
+	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
+	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
+	// 容器内无桌面端 Turing SDK，这是把外部（宿主/桌面端）生成的 token 注入的入口。
+	// 另见 DeviceTokenFile 缓存读取：宿主可把 token 落 /app/data/device_token 共用。
+	DeviceToken string
+
+	// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
+	// 读取频率限 5 分钟一次缓存（见 device_token.go），>1KB 或读失败则忽略。
+	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
+	DeviceTokenFile string
+
+	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
+	// 非空（如 "WorkBuddy"）则四头跟随，对齐官方桌面端 client 识别。
+	ClientName string
+
+	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
+	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
+	// config upstream.client_version 覆盖。
+	ClientVersion string
+
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
+	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
+	CliVersion string
+
+	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
+	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 参数传入 ChatStream，
+	// 由 ChatHeaders 注入（不再挂共享字段，杜绝并发串扰）。
+	PassthroughIP bool
+
+	ChatBaseCN    string
+	BillingBaseCN string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -131,21 +312,27 @@ func New() *Client {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
+		// 聊天 SSE 首字节前硬上限（对短 RPC 无实际影响：其总时长 120s 更先到期）。
+		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		ChatBaseGlobal:       "https://www.workbuddy.ai",
-		BillingBaseGlob:      "https://www.workbuddy.ai",
 	}
 }
 
-func (c *Client) chatBase(a *auth.Auth) string {
-	if a != nil && a.Region() == "global" {
-		return c.ChatBaseGlobal
+// chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
+func (c *Client) chatHTTP() *http.Client {
+	if c.ChatHTTP != nil {
+		return c.ChatHTTP
 	}
+	return c.HTTP
+}
+
+func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
@@ -169,11 +356,15 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
-	if a != nil && a.Region() == "global" {
-		return c.BillingBaseGlob
-	}
 	return c.BillingBaseCN
 }
+
+// billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
+// 统一走 billingJSON 发请求。
+const (
+	billingMeterPath = "/v2/billing/meter/get-user-resource"
+	dailyCheckinPath = "/v2/billing/meter/daily-checkin"
+)
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
@@ -214,7 +405,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err != nil {
 		return err
 	}
-	RefreshHeaders(req, a)
+	c.RefreshHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -243,29 +434,38 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+// clientIP 为本次请求的客户端 IP（PassthroughIP=true 时注入；空串表示不透传）。
+// 按**请求传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	c.ChatHeaders(req, a, clientIP)
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	resp, err := c.chatHTTP().Do(req)
 	if err != nil {
-		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
+		cancel()
+		log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+			logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
+	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
+	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
+	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
@@ -285,12 +485,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	origin := originRefererFor(a)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", clientUA)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -386,7 +582,6 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
-	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -396,13 +591,7 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return 0, err
-	}
-	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
 	if err != nil {
 		return 0, err
 	}
@@ -444,14 +633,24 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	url := c.billingBase(a) + "/v2/billing/meter/daily-checkin"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return err
-	}
-	BillingHeaders(req, a)
-	_, err = c.doJSON(req)
+	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
 	return err
+}
+
+// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
+// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+func IsAlreadyCheckin(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	for _, m := range alreadyCheckinMarkers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

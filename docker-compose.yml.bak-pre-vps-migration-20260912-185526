@@ -1,0 +1,23 @@
+services:
+  wb2api:
+    build: .
+    # 固定镜像名：与手工 `docker run` 时代保持一致，避免出现 project-* / *-wb2api 两份镜像。
+    image: project-workbuddy2api
+    container_name: workbuddy2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+    # 声明外部网络：与既有容器拓扑一致（trae2api 亦在此网络）。
+    # 若改为 compose 默认网络，会导致容器重建后网络归属漂移。
+    networks:
+      - ai-mesh
+
+networks:
+  ai-mesh:
+    external: true
