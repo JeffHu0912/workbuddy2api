@@ -35,3 +35,6 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# 本地 compose 备份（迁移/回滚用，不入库）
+docker-compose.yml.bak*
