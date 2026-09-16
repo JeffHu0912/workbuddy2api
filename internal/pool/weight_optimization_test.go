@@ -462,3 +462,41 @@ func writeState(t *testing.T, fp, content string) {
 
 // pickWeightedScale 暴露定点放大常数给测试对齐（P1-B 断言定点值用）。
 const pickWeightedScale = 1_000_000
+
+// TestFallbackEarliestExpiryAdvancesUsedSeq 全冷却兜底选号
+// （pickEarliestExpiryLocked）同样推进 usedSeq/pickSeq。
+//
+// entry.usedSeq 的契约是「每次被选中时取 p.pickSeq 自增值」（entry.go），pick() 正常
+// 路径与粘性命中（PickByUIDForModel，见上面 TestStickyPickAdvancesUsedSeq）都已遵守。
+// 兜底路径此前只写 lastUsed 就 return：被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
+// LRU 兜底（按 usedSeq 取最旧，pick.go）眼里永远是「最旧」，刚被用过就被立刻再选——
+// 防集中/防惊群失效，且与同一函数里已更新 lastUsed 的事实自相矛盾。
+func TestFallbackEarliestExpiryAdvancesUsedSeq(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "late"})
+	p.Add(&auth.Auth{UID: "early"})
+	// 两个都软冷却（全冷却 → 走兜底）；early 更早到期 → 兜底选 early。
+	p.Cooldown("late", CoolSoft, 2*time.Hour, "x")
+	p.Cooldown("early", CoolSoft, time.Hour, "x")
+
+	got := p.Pick("")
+	if got == nil || got.UID != "early" {
+		t.Fatalf("全冷却兜底应选最早到期的 early, got %+v", got)
+	}
+
+	p.mu.RLock()
+	seqEarly := p.byUID["early"].usedSeq
+	seqLate := p.byUID["late"].usedSeq
+	pickSeq := p.pickSeq
+	p.mu.RUnlock()
+
+	if seqEarly == 0 {
+		t.Errorf("兜底选号未推进 usedSeq: early=%d（兜底也是选中，违反 entry.usedSeq 契约「每次被选中时取 p.pickSeq 自增值」）", seqEarly)
+	}
+	if seqEarly != pickSeq {
+		t.Errorf("兜底推进的 usedSeq 应等于 pickSeq: early=%d pickSeq=%d", seqEarly, pickSeq)
+	}
+	if seqEarly <= seqLate {
+		t.Errorf("兜底被选中的 early usedSeq=%d 应高于未被选中的 late=%d（否则 LRU 兜底误判其为最旧）", seqEarly, seqLate)
+	}
+}
