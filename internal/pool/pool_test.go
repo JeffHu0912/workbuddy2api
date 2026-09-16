@@ -1950,6 +1950,31 @@ func TestRestoreNoRedisUsesLocal(t *testing.T) {
 	}
 }
 
+func TestRestoreUsesRedisWhenLocalMissing(t *testing.T) {
+	// 本地 state.json 不存在（首次在新卷/新节点启动）+ 有效 Redis 快照 → 必须采用快照。
+	// 此时本地没有可"优先"的状态，快照是本轮唯一来源（快照作为"启动恢复备份"的核心场景，
+	// 见 StoreSnapshotter 契约）。旧实现把该情形并进「本地较新」的 fall-through：快照被
+	// 静默丢弃（既不改内存也不置 dirty），全池运行态清零，且打出"本地较新于快照"的假日志。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json") // 刻意不创建：模拟新卷首启
+
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("本地缺失时应采用 Redis 快照恢复账号，但池内无 u1（有效快照被丢弃）")
+	}
+	if st.Credits != 999 {
+		t.Fatalf("should restore from Redis snapshot when local missing: credits=%d want 999", st.Credits)
+	}
+}
+
 func TestStatusExposesRuntimeFields(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
