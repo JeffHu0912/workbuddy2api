@@ -14,11 +14,33 @@
 #   3. 你在浏览器打开 URL 完成登录
 #   4. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
 #   5. 重启 workbuddy2api 容器加载新账号
+#
+# 号池选择（2026-09-16 分池后）：--pool=phone（默认）| --pool=qq
+#   phone → 落盘 ./auths/、重启 workbuddy2api、探活 :7863（config.json）
+#   qq    → 落盘 ./auths-qq/、重启 workbuddy2api-qq、探活 :7865（config-qq.json）
 set -euo pipefail
 
 cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
+PORT=7863
+CFG="config.json"
+
+# ─── 号池选参：--pool=phone|qq（不与其他 --realm 传参冲突）──────────
+POOL="phone"
+for arg in "$@"; do
+    case "$arg" in
+        --pool=phone) POOL="phone" ;;
+        --pool=qq)    POOL="qq" ;;
+    esac
+done
+if [[ "$POOL" == "qq" ]]; then
+    AUTH_DIR="./auths-qq"
+    CONTAINER="workbuddy2api-qq"
+    PORT=7865
+    CFG="config-qq.json"
+    echo "（号池: qq → $AUTH_DIR / $CONTAINER / :$PORT）"
+fi
 
 mkdir -p "$AUTH_DIR"
 
@@ -195,7 +217,7 @@ try:
     st = os.stat(auth_file)
     if st.st_uid != CONTAINER_UID:
         print(f"\n⚠️  权限警告：{auth_file} 属主 uid={st.st_uid}，容器内 app(uid={CONTAINER_UID}) 可能读不到")
-        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths")
+        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} {os.path.dirname(auth_file) or '.'}")
         print(f"    或在容器内登录（属主自动正确）：docker compose exec -it wb2api bash -c './login.sh'\n")
 except Exception:
     try:
@@ -206,7 +228,7 @@ except Exception:
     auth_dir = os.path.dirname(auth_file) or "."
     if not os.access(auth_dir, os.W_OK):
         print(f"\n❌ 写入失败：目录 {auth_dir} 不可写（权限不足）", file=sys.stderr)
-        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} ./auths", file=sys.stderr)
+        print(f"    请执行：chown -R {CONTAINER_UID}:{CONTAINER_UID} {auth_dir}", file=sys.stderr)
         print(f"    或在容器内登录：docker compose exec -it wb2api bash -c './login.sh'\n", file=sys.stderr)
     raise
 print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
@@ -353,9 +375,9 @@ if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
     sleep 2
-    # API_KEY 从 config.json 读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
-    API_KEY=$(python3 -c "import json; print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null)
-    COUNT=$(curl -s http://127.0.0.1:7863/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+    # API_KEY 从对应池配置文件读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
+    API_KEY=$(python3 -c "import json; print(json.load(open('$CFG')).get('api_key',''))" 2>/dev/null)
+    COUNT=$(curl -s http://127.0.0.1:$PORT/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
     echo "服务已重启，当前账号数: $COUNT"
 else
     echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"

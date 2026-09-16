@@ -1,7 +1,9 @@
 # Auth & secrets
 auths/
+auths-qq/
 auths-reserve/
 data/
+data-qq/
 *.key
 *.pem
 *.env
@@ -16,6 +18,8 @@ data/
 
 # Config with secrets (use config.example.json)
 config.json
+config-qq.json
+config.json.bak*
 
 # Build artifacts
 *.tmp
