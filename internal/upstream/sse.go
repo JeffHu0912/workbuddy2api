@@ -30,6 +30,52 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		toolCalls     = map[int]map[string]any{}
 		toolOrder     []int
 	)
+	// mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
+	// delta（流式分片，按 index 累积）与 message（非 delta 整条）共用同一合并逻辑，
+	// 保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
+	//
+	// index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
+	// 但部分上游省略它。缺 index 一律归 0——多调用场景下不同 call 被合并进同一
+	// index 槽，arguments 串联、name 互相覆盖（数据污染）。分派修复（id 优先 /
+	// lastIdx 兜底 / 跳号分配）独立成后续 commit，本提取保持旧归 0 行为不动。
+	mergeToolCallsChunk := func(tcs []any) {
+		for _, tc := range tcs {
+			call, ok := tc.(map[string]any)
+			if !ok {
+				continue
+			}
+			idx := 0
+			if v, ok := call["index"].(float64); ok {
+				idx = int(v)
+			}
+			merged, seen := toolCalls[idx]
+			if !seen {
+				merged = map[string]any{"index": idx}
+				toolCalls[idx] = merged
+				toolOrder = append(toolOrder, idx)
+			}
+			mergeToolCallDelta(merged, call)
+		}
+	}
+	// mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
+	// 非流式拼接，content 只取一次）。role/reasoning_content/tool_calls 与 delta 分支
+	// 同构透出；content 同样置 gotAnyContent，与 delta 路径的 latch 语义一致
+	// （一帧整条 message 之后，后续 delta 帧不重复追加）。
+	mergeMessageFields := func(msg map[string]any) {
+		if r2, ok := msg["role"].(string); ok && r2 != "" {
+			role = r2
+		}
+		if txt, ok := msg["content"].(string); ok {
+			content.WriteString(txt)
+			gotAnyContent = true
+		}
+		if rc, ok := msg["reasoning_content"].(string); ok {
+			reasoning.WriteString(rc)
+		}
+		if tcs, ok := msg["tool_calls"].([]any); ok {
+			mergeToolCallsChunk(tcs)
+		}
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -79,30 +125,16 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 									reasoning.WriteString(rc)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
-									for _, tc := range tcs {
-										call, ok := tc.(map[string]any)
-										if !ok {
-											continue
-										}
-										idx := 0
-										if v, ok := call["index"].(float64); ok {
-											idx = int(v)
-										}
-										merged, seen := toolCalls[idx]
-										if !seen {
-											merged = map[string]any{"index": idx}
-											toolCalls[idx] = merged
-											toolOrder = append(toolOrder, idx)
-										}
-										mergeToolCallDelta(merged, call)
-									}
+									mergeToolCallsChunk(tcs)
 								}
 							}
-							// 有的上游把完整消息放在 message 里（非 delta）
+							// 有的上游把完整消息放在 message 里（非 delta）：
+							// 整条并入（role/content/reasoning_content/tool_calls），
+							// 与 delta 分支同构。delta 已取过正文（gotAnyContent）则跳过
+							// （避免与 delta 路径重复拼接——PR #134 的 latch 语义）。
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								if txt, ok := msg["content"].(string); ok {
-									content.WriteString(txt)
-								}
+								mergeMessageFields(msg)
+							}
 							}
 						}
 					}
