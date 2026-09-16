@@ -107,6 +107,37 @@ func TestModelCostStaleIgnored(t *testing.T) {
 	}
 }
 
+// TestModelCostPrunedOnPick 过期观测必须被**回收**（不只是被忽略）。
+//
+// 与 TestModelCostStaleIgnored 的区别：那个只断言 modelCostOf 读回 ok=false，
+// 过期条目仍留在 map 里；本测试断言 pick 写锁路径真的把它删掉——否则 modelCost
+// 与 modelCooldowns「map 不无限膨胀」的口径不一致（后者有 pruneExpiredModelCooldowns）。
+func TestModelCostPrunedOnPick(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteModelCost("u1", "stale-model", 12, 1000)
+
+	p.mu.Lock()
+	if len(p.byUID["u1"].modelCost) != 1 {
+		p.mu.Unlock()
+		t.Fatalf("前置条件不成立：modelCost len=%d want 1", len(p.byUID["u1"].modelCost))
+	}
+	mc := p.byUID["u1"].modelCost["stale-model"]
+	mc.LastSeen = time.Now().Add(-2 * modelCostTTL) // 手工做旧
+	p.byUID["u1"].modelCost["stale-model"] = mc
+	p.mu.Unlock()
+
+	p.Pick("") // pick 写锁路径做惰性回收
+
+	p.mu.RLock()
+	_, still := p.byUID["u1"].modelCost["stale-model"]
+	n := len(p.byUID["u1"].modelCost)
+	p.mu.RUnlock()
+	if still {
+		t.Errorf("过期 modelCost 条目未被回收（map 只增不减），len=%d", n)
+	}
+}
+
 // TestModelCostEMASmoothing 观测按 EMA 平滑，单次异常不主导决策。
 func TestModelCostEMASmoothing(t *testing.T) {
 	p := New("")

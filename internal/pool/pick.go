@@ -39,9 +39,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
+	// 惰性清理过期的 6004 模型级冷却与成本台账（两者的 map 都不无限膨胀；
+	// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 	for _, e := range p.byUID {
 		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }

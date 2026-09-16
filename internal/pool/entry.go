@@ -217,6 +217,32 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return true
 }
 
+// pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
+// pruneExpiredModelCooldowns 同形同调用点）。
+//
+// 为什么必须有它：modelCost 此前只在**读**（modelCostOf）、**落盘**（persist）、
+// **恢复**（persist）、**status**（state.go）四处做"过期过滤"，内存里的条目本身
+// 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
+// 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
+// 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
+//（见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
+// 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
+// 被反复判定为过期（只是没人删）。
+//
+// 观测只在成功请求路径写入（NoteModelCost），且 model 不与目录校验，故增长受
+// "历史服务过的模型名"限制——不是无界泄漏，但同样是"只增不减"的无回收表。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelCosts(now time.Time) {
+	if len(e.modelCost) == 0 {
+		return
+	}
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			delete(e.modelCost, m)
+		}
+	}
+}
+
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
 // pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
