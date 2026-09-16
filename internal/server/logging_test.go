@@ -198,10 +198,10 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4.1-flash", "stream", "00e26541abcdef", "sample", http.StatusOK, 1234)
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4.1-flash", "| stream |", "| 200 |", "sample(00e26541)", "TTFB=412ms", "tok=1234", "tok/s", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -212,23 +212,56 @@ func TestLogChatRowFormat(t *testing.T) {
 	}
 }
 
+// TestLogChatRowModelNotTruncated 守护模型名不再被截断。
+// 旧实现硬截 11 字节，把 "cn:deepseek-v4.1-flash" 切成 "cn:deepseek"，
+// 运维会误以为是另一个模型（真实踩坑点）。26 列宽覆盖 realm 前缀 + 最长模型名。
+func TestLogChatRowModelNotTruncated(t *testing.T) {
+	withChatLog(t)
+	for _, model := range []string{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"} {
+		out := captureStdout(t, func() {
+			logChatRow(0, time.Second, model, "stream", "00e26541abcdef", "sample", http.StatusOK, 1)
+		})
+		if !strings.Contains(out, model) {
+			t.Errorf("model %q truncated to something else:\n%s", model, out)
+		}
+	}
+}
+
+// TestLogChatRowNicknameFallback 无昵称（旧 auth 文件未落 account.nickname）时退回 uid8。
+func TestLogChatRowNicknameFallback(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", "", http.StatusOK, 1)
+	})
+	if !strings.Contains(out, "00e26541 ") && !strings.Contains(out, "00e26541|") {
+		t.Errorf("want bare uid8 label without nickname:\n%s", out)
+	}
+	if strings.Contains(out, "(") {
+		t.Errorf("empty nickname must not render parens:\n%s", out)
+	}
+}
+
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1)
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"TTFB=-", "tok=-", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
+	}
+	// 无 usage 时速率列也应是裸 "-"，不能凭空报 0.0tok/s（会把缺失当零值读）。
+	if strings.Contains(out, "0.0tok/s") || strings.Contains(out, "-tok/s") {
+		t.Errorf("missing usage must render bare '-' rate column:\n%s", out)
 	}
 }
 
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -261,7 +294,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "| u1 ", "TTFB=", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
@@ -288,7 +321,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| sync |", "| 200 |", "TTFB=-", "tok=1"} {
+	for _, want := range []string{"| sync ", "| 200 |", "TTFB=-", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("sync row missing %q:\n%s", want, out)
 		}
@@ -310,7 +343,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"| u1 ", "| 503 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}
