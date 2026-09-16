@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -890,6 +891,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return nil
 	}
 	a.AccessToken = tok.AccessToken
+	rtRotated := tok.RefreshToken != "" && tok.RefreshToken != a.RefreshToken
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
 	}
@@ -900,7 +902,34 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.ExpiresIn > 0 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
+	// 刷新成功日志（本地 fork 增补）：只打过期日期与滚动标志，不落任何 token 原文。
+	// refreshToken 过期是自动续的终点（12153 后只能重登），滚动与否值得显式可见。
+	log.Printf("[auth] refresh ok uid=%s access_exp=%s refresh_exp=%s rt_rotated=%t expires_in=%ds",
+		logfmt.UID8(a.UID), jwtExpDate(a.AccessToken), jwtExpDate(a.RefreshToken), rtRotated, tok.ExpiresIn)
 	return nil
+}
+
+// jwtExpDate 解析 JWT 的 exp 声明，输出本地时区 YYYY-MM-DD；解析失败返回 "-"。
+// 只用于日志观测，任何解析错误都不上抛——绝不让打日志打断刷新成功路径。
+func jwtExpDate(tok string) string {
+	if tok == "" {
+		return "-"
+	}
+	parts := strings.SplitN(tok, ".", 3)
+	if len(parts) < 2 {
+		return "-"
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "-"
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil || claims.Exp <= 0 {
+		return "-"
+	}
+	return time.Unix(claims.Exp, 0).Format("2006-01-02")
 }
 
 // chatPath 按 realm 返回 chat 端点路径（不含 base）：
