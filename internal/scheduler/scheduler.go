@@ -414,7 +414,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -493,7 +493,7 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 //
 // 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
 func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
-	if a == nil || a.AccessToken == "" {
+	if a == nil || a.AccessTokenValue() == "" {
 		return
 	}
 	// global 门控：连登奖励/抽奖链只服务 CN。国际版 /activity/growth/* 端点虽同构存在

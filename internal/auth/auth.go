@@ -50,6 +50,42 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
+// AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt
+// （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
+// （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
+// global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
+// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
+// 就是池内同一个对象）。无同步直读构成数据竞争，go test -race 实证：
+//
+//	WARNING: DATA RACE
+//	Write at ... by goroutine:
+//	  (*Client).RefreshToken()  internal/upstream/client.go:929
+//	Previous read at ... by goroutine:
+//	  (*Client).ChatHeaders()   internal/upstream/headers.go:224
+//
+// （回归测试 upstream.TestChatHeadersRacesRefreshToken）。
+func (a *Auth) AccessTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.AccessToken
+}
+
+// DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
+func (a *Auth) DomainValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Domain
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
@@ -70,6 +106,15 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked()
+}
+
+// realmLocked Realm 的无锁内部实现：仅限**已持 a.mu** 的调用方使用（sync.Mutex 不可重入，
+// 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
+// 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
+func (a *Auth) realmLocked() string {
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -99,6 +144,8 @@ func ResolveRealm(explicit, domain string) string {
 // （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
 // （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
 func (a *Auth) BackfillRealm() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
@@ -108,7 +155,11 @@ func (a *Auth) BackfillRealm() (bool, string) {
 }
 
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
-func (a *Auth) RealmStored() string { return a.realm }
+func (a *Auth) RealmStored() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realm
+}
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
@@ -122,6 +173,8 @@ func isGlobalDomain(d string) bool {
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}

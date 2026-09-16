@@ -1274,7 +1274,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1354,7 +1354,7 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
 	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
 	c.CommonHeaders(req, a)
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
