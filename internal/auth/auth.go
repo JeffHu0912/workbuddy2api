@@ -86,6 +86,28 @@ func (a *Auth) DomainValue() string {
 	return a.Domain
 }
 
+// RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
+// 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
+// `a.RefreshToken == ""`）必须经此取值，勿直读字段。
+//
+// 与 #125 修的 AccessToken/Domain 属同一类：守卫是纯读、刷新是纯写，二者无同步即
+// 构成数据竞争（RefreshToken 写回在 client.go「第 2 段（锁内）」的 `if tok.RefreshToken
+// != ""` 分支）。go test -race 实证（回归测试 scheduler.TestKeepaliveGuardRacesRefreshToken）：
+//
+//	WARNING: DATA RACE
+//	Read at ... by goroutine:
+//	  (*Scheduler).RunKeepaliveNow()  internal/scheduler/scheduler.go:654
+//	Previous write at ... by goroutine:
+//	  (*Client).RefreshToken()        internal/upstream/client.go:931
+func (a *Auth) RefreshTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.RefreshToken
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
