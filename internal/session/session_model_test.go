@@ -9,7 +9,7 @@ import (
 // 不可用时，必须重分配——即使它在别的模型上仍然可用。
 //
 // 回归背景：粘性绑定只记 uid，而同一个会话可能换模型。账号被 6004 模型级限额后
-// 对其他模型仍可用（pool.healthyForModel 的 softRateModel 豁免），此时若只按账号级
+// 对其他模型仍可用（pool.healthyForModel 的模型级冷却豁免），此时若只按账号级
 // 可用性校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 func TestResolveForModelReassignsOnModelLimit(t *testing.T) {
 	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)

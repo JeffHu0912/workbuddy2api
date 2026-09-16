@@ -19,6 +19,84 @@ const sseFree = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"cre
 	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":500,\"credit\":0}}\n\n" +
 	"data: [DONE]\n\n"
 
+// sseUsageNoCredit 末帧带 usage 但**无 credit 字段**（R9(c) 分支：global SSE 末帧形态）。
+// credit 缺失 ≠ 免费——handler 不得据此把该号记成 tier0。
+const sseUsageNoCredit = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
+	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":100}}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestStreamUsageNoCreditNotRecorded (P0, 端到端 RED→GREEN): 流式末帧 usage 缺 credit
+// 时 handler 不得调用 NoteModelCost——缺观测不得当 0 成本写账本（否则收费号误判 tier0 免费，
+// PLAN-global-audit 审计点 10 指认的 P0）。直接用账本断言：请求 N 次后池内对该模型
+// 无任何成本观测（ModelCost ok=false）；若修复前 NoteModelCost(uid, m, 0, ...) 被调用，
+// 这里能直接看到 per1k=0 被记下。
+func TestStreamUsageNoCreditNotRecorded(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseUsageNoCredit, true // usage 有但无 credit
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at-u2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	for i := 0; i < 8; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"m","messages":[],"stream":true}`)))
+		if rec.Code != 200 {
+			t.Fatalf("请求失败: code=%d", rec.Code)
+		}
+	}
+	// 修复后：no-credit 的 usage 不算合法观测 → 账本为空。
+	if per1k, ok := p.ModelCost("u1", "m"); ok {
+		t.Errorf("usage 无 credit 不应记入成本账本: u1/m per1k=%v (缺失被当 0 成本)", per1k)
+	}
+	if per1k, ok := p.ModelCost("u2", "m"); ok {
+		t.Errorf("usage 无 credit 不应记入成本账本: u2/m per1k=%v (缺失被当 0 成本)", per1k)
+	}
+}
+
+// TestStreamUsageCreditZeroRecorded 端到端回归：显式 credit:0 是合法免费观测，
+// handler 必须记账（per1k=0，ok=true）——真 0 不许丢。
+// 双号行为：u1 返回 sseWithCredit（收费）、u2 返回 sseFree（显式 credit:0）。
+// 账本断言：u2/m2 必须存在且 per1k==0（免费观测被保留）；u1/m2 per1k==1.0（收费被记录）。
+func TestStreamUsageCreditZeroRecorded(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-u2" {
+			return 200, sseFree, true // u2 显式 credit:0（免费）
+		}
+		return 200, sseWithCredit, true // u1 收费
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at-u2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+
+	// 发若干次请求，让两个号都被选中（100ms 防撞号窗口下交替）。
+	for i := 0; i < 12; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"m2","messages":[],"stream":true}`)))
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	}
+	// 连续 12 次请求两号必各自入账：u2 显式 0 必须是合法观测（不许丢）。
+	per1k, ok := p.ModelCost("u2", "m2")
+	if !ok {
+		t.Fatalf("u2 显式 credit:0 未被记入账本（合法免费观测被丢）")
+	}
+	if per1k != 0 {
+		t.Errorf("u2 显式 credit:0 记账 per1k=%v want 0", per1k)
+	}
+	// u1 收费观测对照：per1k = 2.0 credit / 2000 token * 1000 = 1.0。
+	if per1k, ok := p.ModelCost("u1", "m2"); !ok || per1k != 1.0 {
+		t.Errorf("u1 收费观测 per1k=%v ok=%v want 1.0/true", per1k, ok)
+	}
+}
+
 // TestChatRecordsModelCost 端到端：成功请求把上游 usage.credit 记入成本账本，
 // 并据此让后续请求优先走免费的号。
 //

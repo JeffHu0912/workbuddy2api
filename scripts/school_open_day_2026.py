@@ -827,6 +827,12 @@ def main():
         sys.exit(1)
 
     for auth in auths:
+        # global realm 不适用 CN 开学季任务/转盘：明确跳过、不发起任何请求。
+        if tc.auth_is_global(auth):
+            uid8 = (auth.get("uid") or "")[:8] or "?"
+            print(f"[skip] {uid8} global realm 不适用 CN 任务")
+            stats["skip"] += 1
+            continue
         try:
             if a.lottery_only:
                 lottery_account(auth, a, stats)

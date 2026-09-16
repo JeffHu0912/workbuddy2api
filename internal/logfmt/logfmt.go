@@ -10,6 +10,27 @@
 // 本包不引入日志库，只提供 UID8 截断 helper，供各包替代裸写 [:8]（防 uid 短于 8 越界）。
 package logfmt
 
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+// Truncate 截断字符串到 n 字节上限（先 TrimSpace，与旧 upstream/内部实现口径
+// 一致），切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
+// （"将在 … 重置"），按字节切会出半截序列乱码。短于 n 原样返回；n<=0 返回空串。
+func Truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		// s[n] 是切点后的首字节：是 rune 的后续字节（continuation）说明切点落在
+		// 多字节字符中间，逐字节回退到 rune 边界（该字符整个让出）。
+		for n > 0 && !utf8.RuneStart(s[n]) {
+			n--
+		}
+		return s[:n]
+	}
+	return s
+}
+
 // UID8 返回 uid 的前 8 位；空 uid 返回 "-"（与 server.uidPrefix 对齐）。
 //
 // 用于调度类与非调度类日志行，把 <task> <full-uid>: ... 改为 <task> <uid8>: ...

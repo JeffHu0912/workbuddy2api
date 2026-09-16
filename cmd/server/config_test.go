@@ -76,6 +76,9 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.Pool.MaxInFlight != 3 {
 		t.Errorf("max_in_flight=%d want 3", c.Pool.MaxInFlight)
 	}
+	if c.Pool.MaxInFlightGlobal != 2 {
+		t.Errorf("max_in_flight_global=%d want 2 (WAF P1-1 global 档默认)", c.Pool.MaxInFlightGlobal)
+	}
 	if c.Pool.BreakerThreshold != 3 {
 		t.Errorf("breaker_threshold=%d want 3", c.Pool.BreakerThreshold)
 	}
@@ -109,6 +112,7 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 		"upstash":{"url":"https://foo.upstash.io","token":"tok"},
 		"pool":{
 			"max_in_flight":5,
+			"max_in_flight_global":4,
 			"breaker_threshold":4,
 			"breaker_cooldown":"10m",
 			"breaker_cooldown_max":"2h",
@@ -126,6 +130,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 	if c.Pool.MaxInFlight != 5 || c.Pool.BreakerThreshold != 4 {
 		t.Errorf("pool=%+v", c.Pool)
+	}
+	if c.Pool.MaxInFlightGlobal != 4 {
+		t.Errorf("max_in_flight_global=%d want 4 (config 覆盖默认)", c.Pool.MaxInFlightGlobal)
 	}
 	if c.BreakerCooldownDur.Minutes() != 10 || c.BreakerCooldownMaxD.Hours() != 2 {
 		t.Errorf("breaker durations=%v/%v", c.BreakerCooldownDur, c.BreakerCooldownMaxD)
@@ -289,6 +296,16 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
+			c.Schedule.SchoolEnabled, c.Schedule.CatEnabled)
+	}
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
@@ -316,6 +333,15 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
 	}
 }
 
@@ -549,17 +575,17 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
-func TestPromptDefaultCustom(t *testing.T) {
+// TestPromptDefaultMode 默认 prompt.mode=passthrough 且不加载 PromptText（透传客户端原始 system）。
+func TestPromptDefaultMode(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText == "" {
-		t.Error("PromptText should be non-empty (built-in default)")
+	if c.PromptText != "" {
+		t.Errorf("default passthrough should not load PromptText, got len=%d", len(c.PromptText))
 	}
 }
 
@@ -607,7 +633,9 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	// 路径写进 JSON 字符串需转义反斜杠：Windows 下 filepath.Join 生成 C:\Users\...，
+	// 原样拼接会让 \U 成为非法 JSON 转义。ToSlash 统一为正斜杠（跨平台可解析）。
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +657,7 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 走缺省 passthrough。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -638,8 +666,8 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)

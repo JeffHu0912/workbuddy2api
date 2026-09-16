@@ -85,6 +85,11 @@ type chatRequestEvent struct {
 // conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
 // requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
+//
+// 与 issue #35 会话头族（X-Conversation-Request-ID）保持独立：本接口是 growth 域
+// 活跃上报（仅点亮连登/first_buddy，每号每天 1 次），event.requestId 是事件级标识，
+// 后台按 growth 事件去重，不走 chat 后台的 X-Conversation-Request-ID 聚合——对齐
+// 官方 chat_request_send 事件形状（probe_active.py），刻意不复用聚合主键。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
 	if requestID == "" {
 		requestID = conversationID

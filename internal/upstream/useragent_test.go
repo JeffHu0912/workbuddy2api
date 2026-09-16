@@ -19,9 +19,9 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return jsonResp(200, `{"code":0}`), nil
 }
 
-// TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
+// TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent 未配）行为：
 // chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 不设 UA 头（保持现状，Go 客户端自带默认 UA）。
+// UA=单段 `WorkBuddy/<clientVersion>`（client_name 缺省即伪造官方桌面端指纹）。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -31,7 +31,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 		{
 			name: "chat",
 			call: func(c *Client) error {
-				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+				rc, status, _, err := c.ChatStream(&auth.Auth{AccessToken: "at", UID: "u1"}, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 				if status != 200 {
 					t.Fatalf("chat status=%d", status)
 				}
@@ -47,7 +47,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "",
+			wantUA: billingUAWorkBuddy, // client_name 缺省 → 伪造官方单段 UA
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,7 +91,7 @@ func TestUserAgentOverrideAllOutbound(t *testing.T) {
 		UserAgent:     ua,
 	}
 	// chat
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -128,15 +128,17 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 }
 
 // TestFetchModelsUsesConfiguredUA FetchModels 手工 Set UA 也走覆盖。
+// v3-config-merge：FetchModels 并发打企业端点 + /v3/config 两路，两路都须带覆盖 UA。
 func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") {
+			if !strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") &&
+				!strings.HasSuffix(r.URL.Path, "/v3/config") {
 				t.Errorf("path=%s", r.URL.Path)
 			}
 			if got := r.Header.Get("User-Agent"); got != "FetchAgent/2" {
-				t.Errorf("FetchModels UA = %q want FetchAgent/2", got)
+				t.Errorf("FetchModels UA = %q want FetchAgent/2 (path=%s)", got, r.URL.Path)
 			}
 			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.2","name":"GLM","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":[]},"disabled":false}],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
 		})},
@@ -170,7 +172,7 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -205,7 +207,7 @@ func TestUserAgentExplicitOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     explicitString,
 	}
-	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), ""); status != 200 || err != nil {
+	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
 		t.Errorf("chat: status=%d err=%v", status, err)
 	} else if rc != nil {
 		rc.Close()
@@ -229,7 +231,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		ClientVersion: "6.0.0",
 	}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
 	if status != 200 || err != nil {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -294,9 +296,9 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	}
 }
 
-// TestBillingUA_WhenClientNameEmpty client_name 空 = 保持现状：不设 UA（Go 默认 UA），
-// 即使 version 配置了也不上 UA。
-func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
+// TestBillingUA_WhenClientNameSaaS 显式 client_name="SaaS" = 还原旧行为：不设 UA
+// （Go 默认 UA），即使 version 配置了也不上 UA。
+func TestBillingUA_WhenClientNameSaaS(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	var ua string
 	const fullResp = `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`
@@ -307,13 +309,14 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 		})},
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
-		ClientVersion: "6.0.0", // 配置了版本但 client_name 空 → 仍不设 UA
+		ClientName:    "SaaS",  // 显式退出指纹伪造
+		ClientVersion: "6.0.0", // 配置了版本但 client_name=SaaS → 仍不设 UA
 	}
 	if _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
 	if ua != "" {
-		t.Errorf("billing UA = %q want empty (client_name unset)", ua)
+		t.Errorf("billing UA = %q want empty (client_name=SaaS)", ua)
 	}
 	if got := c.billingUA(); got != "" {
 		t.Errorf("billingUA() = %q want empty", got)

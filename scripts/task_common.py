@@ -8,7 +8,9 @@
   - chat 域（copilot.tencent.com）：growth / tasks / buddy / streak / chat/completions
   - billing 域（www.codebuddy.cn）：/v2/report
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
-  - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
+  - claim  : POST /activity/growth/tasks/{task_code}/claim  （路径含 code、无 body；
+     chat 域 400 时降级 web 域 www.workbuddy.cn 同路径 + x-client-platform: web）
+  - 领养   : POST /activity/growth/buddy/agreement + /buddy/first（幂等，+300c+8e）
 """
 import json, os, time, glob, urllib.request, urllib.error
 
@@ -36,7 +38,7 @@ BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS   = "/v2/activity/growth/tasks/accept"
-PATH_CLAIM_REWARD   = "/v2/activity/growth/tasks/reward/claim"
+PATH_CLAIM_REWARD   = "/activity/growth/tasks"   # + "/{code}/claim"（M15 chat 域实测口径）
 PATH_BUDDY_FIRST    = "/activity/growth/buddy/first"
 PATH_BUDDY_AGREEMENT = "/activity/growth/buddy/agreement"
 PATH_STREAK         = "/activity/growth/streak"
@@ -49,7 +51,9 @@ CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 def load_auth(uid_or_file: str) -> dict:
     """从 auths/ 加载账号凭证，uid_or_file 为 uid 前缀或 auths 文件名。
 
-    返回 {token, uid, domain, nick, file} 五元组。
+    返回 {token, uid, domain, nick, file, realm} 六元组。
+    realm 读取兼容嵌套形（`auth.realm`，login.sh --realm=global 落盘形态）与
+    扁平形（顶层 `realm`）；两种都缺省 → "cn"（老 CN 凭证零回归）。
     """
     if os.path.sep in uid_or_file or uid_or_file.endswith(".json"):
         p = uid_or_file
@@ -61,11 +65,28 @@ def load_auth(uid_or_file: str) -> dict:
         if not hits:
             raise SystemExit(f"no auth for {pre}")
         p = hits[0]
-    d = json.load(open(p))
+    # encoding="utf-8" 必须显式指定：Windows 上 open() 默认用 locale 代码页
+    # （中文系统为 GBK），而 auth 文件是 UTF-8 写入的，非 ASCII 昵称会触发
+    # UnicodeDecodeError，使所有脚本类任务（school/cat/trial 等）直接中断。
+    d = json.load(open(p, encoding="utf-8"))
     a, acc = d["auth"], d["account"]
+    realm = a.get("realm") or d.get("realm") or ""
     return {"token": a["accessToken"], "domain": a.get("domain") or "",
             "uid": acc["uid"], "nick": acc.get("nickname", ""),
-            "file": os.path.basename(p)}
+            "file": os.path.basename(p), "realm": realm}
+
+
+def auth_is_global(auth: dict) -> bool:
+    """判定账号是否属于 global realm：realm==global 或 domain 后缀 .workbuddy.ai。
+
+    与 Go auth.Realm() 的判定口径一致（显式 realm 优先于 domain 回落）。
+    供 CN-only 任务脚本跳过 global 账号、明确提示，避免把 global token 打向
+    copilot.tencent.com/codebuddy.cn（全球版无任务中心，打 CN 端点属错误行为）。
+    """
+    if (auth.get("realm") or "").strip().lower() == "global":
+        return True
+    d = (auth.get("domain") or "").strip().lower()
+    return d == "workbuddy.ai" or d.endswith(".workbuddy.ai")
 
 
 def chat_base(auth: dict) -> str:
@@ -143,18 +164,50 @@ def accept_tasks(auth, task_codes) -> tuple:
                    {"task_codes": task_codes})
 
 
-def claim_reward(auth, task_code) -> tuple:
-    """POST claim 领取奖励（任务已 complete 后可领）。重复领返回业务错误，安全。"""
-    return do_post(auth, chat_base(auth), PATH_CLAIM_REWARD,
-                   {"task_code": task_code})
-
-
 def get_streak(auth) -> int:
     """GET /activity/growth/streak 连登天数（只读 oracle）。失败返回 -1 记日志。"""
     st, d = do_get(auth, chat_base(auth), PATH_STREAK)
     if st != 200:
         return -1
     return (d.get("data", {}).get("streak", {}) or {}).get("days", 0)
+
+
+def claim_reward(auth, task_code, web_fallback=True) -> tuple:
+    """POST {chat}/activity/growth/tasks/{code}/claim 领奖（M15 实测端点。
+
+    路径含 task_code、无 body。chat 域 400 时降级 web 域 www.workbuddy.cn 同路径，
+    带 Origin/Referer/x-client-platform: web 头（fork ClaimReward 同款）。
+    重复领返回业务错误码（already_claimed），幂等安全。
+    """
+    path = f"{PATH_CLAIM_REWARD}/{task_code}/claim"
+    st, r = do_post(auth, chat_base(auth), path, None)
+    if web_fallback and st == 400:
+        # 400 降级 web 域（fork 实测 Web 成长中心端点）：chat 域路径对部分任务 400
+        web_hdr = {
+            "Authorization": "Bearer " + auth["token"],
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://www.workbuddy.cn",
+            "Referer": "https://www.workbuddy.cn/profile/growth-center",
+            "x-client-platform": "web",
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"),
+            "X-User-Id": auth["uid"],
+            "X-Domain": "https://www.workbuddy.cn",
+        }
+        st, r = do_post(auth, "https://www.workbuddy.cn", path, None, headers=web_hdr)
+    return st, r
+
+
+def buddy_adopt(auth, gap=1.05) -> tuple:
+    """领养第一只 Buddy：agree 协议 → buddy/first（幂等，无猫时送 +300c+8e）。
+
+    前置是当日活跃上报（chat_request_send）——缺口门槛返回 HTTP 400
+    "first_buddy task not completed yet"，调用方按预期跳过。返回 (st_first, resp_first)。
+    """
+    do_post(auth, chat_base(auth), PATH_BUDDY_AGREEMENT, {"agree": True})
+    time.sleep(gap)
+    return do_post(auth, chat_base(auth), PATH_BUDDY_FIRST, {})
 
 
 def chat_event(auth, conversation_id=None, model_id="deepseek-v4-flash",

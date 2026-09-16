@@ -15,10 +15,19 @@
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
+    "school_hours": [12],
+    "cat_hours": [1],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
-    "keepalive_enabled": true
+    "keepalive_enabled": true,
+    "school_enabled": true,
+    "cat_enabled": true
+  },
+  "global": {
+    "enabled": true,
+    "chat_base": "",
+    "billing_base": ""
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -29,14 +38,14 @@
     "cli_version": "",
     "device_token": "",
     "device_token_file": "",
-    "client_name": "",
+    "client_name": "WorkBuddy",
     "passthrough_ip": false
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
   },
   "prompt": {
-    "mode": "custom",
+    "mode": "passthrough",
     "file": ""
   },
   "upstash": {
@@ -45,11 +54,13 @@
   },
   "pool": {
     "max_in_flight": 3,
+    "max_in_flight_global": 2,
     "breaker_threshold": 3,
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
     "idle_weight_per_hour": 0.5,
-    "idle_weight_max": 5.0
+    "idle_weight_max": 5.0,
+    "expiring_soon": "168h"
   },
   "session_sticky": {
     "enabled": true,

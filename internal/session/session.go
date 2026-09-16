@@ -125,18 +125,12 @@ func (r *Router) LoadFromStore() {
 	}
 }
 
-// Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
-// 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
-func (r *Router) Resolve(key string) (string, bool) {
-	return r.ResolveForModel(key, "")
-}
-
 // ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
 // 被该模型限流）走重新分配。
 //
 // 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
-// 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级
+// 对其他模型仍可用（见 pool.healthyForModel 的模型级冷却豁免）。若只按账号级
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()

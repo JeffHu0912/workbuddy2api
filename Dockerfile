@@ -8,7 +8,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/trial_bin ./cmd/trial \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
 
 FROM alpine:3.20
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
@@ -23,8 +25,16 @@ COPY --from=build /out/wb2api /app/wb2api
 COPY --from=build /out/signin_bin /app/signin_bin
 COPY --from=build /out/login /app/login
 COPY --from=build /out/credit /app/credit
-COPY login.sh signin.sh credit.sh /app/
-RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
+COPY --from=build /out/trial_bin /app/trial_bin
+COPY --from=build /out/activity_bin /app/activity_bin
+COPY login.sh signin.sh credit.sh trial.sh /app/
+# 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
+COPY scripts/global_region.py /app/scripts/global_region.py
+COPY scripts/task_common.py /app/scripts/task_common.py
+COPY scripts/task_runner.py /app/scripts/task_runner.py
+COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
+RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
+RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
 COPY config.example.json /app/config.json
 USER app

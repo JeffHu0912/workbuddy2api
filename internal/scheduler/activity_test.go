@@ -185,8 +185,10 @@ func TestRunActivityNowSelfCheckDaysNormal(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: up})
 
 	s.RunActivityNow()
-	if stub.reportCalls.Load() != 1 || stub.streakHits.Load() != 1 {
-		t.Errorf("report_calls=%d streak_hits=%d want 1/1", stub.reportCalls.Load(), stub.streakHits.Load())
+	// streak 命中 2 次 = streak 自检 1 次 + 连登奖励读取（GrowthRewardState）1 次
+	// （days=3 未达 7d 档，奖励链停在无达标档，不再发 redeem）。
+	if stub.reportCalls.Load() != 1 || stub.streakHits.Load() != 2 {
+		t.Errorf("report_calls=%d streak_hits=%d want 1/2（上报 + 自检 + 奖励状态读取）", stub.reportCalls.Load(), stub.streakHits.Load())
 	}
 	// days>=1：checkActivityStreak 返回 false（无可疑）。
 	if s.checkActivityStreak(p.AuthByUID("u1")) {
@@ -545,6 +547,8 @@ func TestNextWakeActivityDisabled(t *testing.T) {
 		ActivityHours:    []int{10},
 		ActivityDisabled: true,
 		KeepaliveHours:   []int{22},
+		SchoolDisabled:   true,
+		CatDisabled:      true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 9, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -576,13 +580,15 @@ func TestCheckinDisabledTravelStillRuns(t *testing.T) {
 	}
 }
 
-// TestAllFourDisabledNoSpin 四类任务全禁用：Run 不空转。
+// TestAllFourDisabledNoSpin 六类任务全禁用：Run 不空转。
 func TestAllFourDisabledNoSpin(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		SchoolDisabled:    true,
+		CatDisabled:       true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},
@@ -590,7 +596,7 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 	})
 	at, kinds := s.nextWake(time.Now())
 	if !at.IsZero() || len(kinds) != 0 {
-		t.Errorf("at=%v kinds=%v want zero/nil（四类全禁用）", at, kinds)
+		t.Errorf("at=%v kinds=%v want zero/nil（六类全禁用）", at, kinds)
 	}
 }
 
@@ -626,7 +632,7 @@ func TestRunDispatchesActivityAndTravel(t *testing.T) {
 		ActivityHours:  []int{},
 		KeepaliveHours: []int{},
 	})
-	// 四类全空 hours → nextWake 回落默认 → 会构造 timer，ctx 取消即返回。
+	// 六类全空 hours → nextWake 回落默认 → 会构造 timer，ctx 取消即返回。
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { s.Run(ctx); close(done) }()

@@ -10,7 +10,7 @@ import "fmt"
 
 // Schedule 排程配置段（对应 config.json 的 "schedule" 对象）。
 //
-// 四类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive。
+// 六类独立排程：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子。
 // cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
 // 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
 type Schedule struct {
@@ -18,7 +18,10 @@ type Schedule struct {
 	TravelHours    []int `json:"travel_hours"`    // [9,21]
 	ActivityHours  []int `json:"activity_hours"`  // [10]
 	KeepaliveHours []int `json:"keepalive_hours"` // [22]
-	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled 显式禁用开关（缺省 true）。
+	SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
+	CatHours       []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
+	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
+	// 显式禁用开关（缺省 true）。
 	//
 	// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
 	//   - 空数组与 null 在老语义里已被"未配置 → 回落默认"占用，改判会静默翻转
@@ -30,6 +33,8 @@ type Schedule struct {
 	TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
 	ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 	KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+	SchoolEnabled    bool `json:"school_enabled"`    // 缺省 true；false = 停开学季任务
+	CatEnabled       bool `json:"cat_enabled"`       // 缺省 true；false = 停夜猫子任务
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
@@ -48,10 +53,14 @@ func DefaultSchedule() Schedule {
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
 		KeepaliveHours:       []int{22},
+		SchoolHours:          []int{12},
+		CatHours:             []int{1},
 		CheckinEnabled:      true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,
 		KeepaliveEnabled:    true,
+		SchoolEnabled:       true,
+		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
 	}
 }
@@ -77,6 +86,12 @@ func (s *Schedule) Normalize() error {
 	if len(s.KeepaliveHours) == 0 {
 		s.KeepaliveHours = []int{22}
 	}
+	if len(s.SchoolHours) == 0 {
+		s.SchoolHours = []int{12}
+	}
+	if len(s.CatHours) == 0 {
+		s.CatHours = []int{1}
+	}
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
@@ -99,7 +114,13 @@ func (s *Schedule) validateHours() error {
 	if err := checkHourRange("schedule.activity_hours", "activity_enabled", s.ActivityHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.keepalive_hours", "keepalive_enabled", s.KeepaliveHours)
+	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", s.KeepaliveHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.school_hours", "school_enabled", s.SchoolHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.cat_hours", "cat_enabled", s.CatHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {
