@@ -126,9 +126,10 @@ func TestExtractKeyPriority(t *testing.T) {
 	}{
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
-		{`{"metadata":{"user_id":"mu"}}`, "mu"},                                                // metadata.user_id 兜底
-		{`{"user":"usr-123"}`, "usr-123"},                                                      // user 兜底
-		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
+		// P1-anti-monopoly：metadata.user_id 不再是粘性键（本地无此键，对齐上游对话级粒度）。
+		{`{"metadata":{"user_id":"mu"}}`, ""},    // user_id 单独出现 → 空（不生成粘性）
+		{`{"user":"usr-123"}`, "usr-123"},        // 顶层 user 字段兜底（本地 fork 扩展）
+		{`{"metadata":{"conversation_id":123}}`, ""}, // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 		// issue #35：客户端实际发 camelCase conversationId，ExtractKey 必须识别。
 		{`{"conversationId":"abc"}`, "abc"},                                            // 顶层 camelCase
@@ -137,7 +138,10 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"conversation_id":"snake","conversationId":"camel"}`, "snake"},              // 顶层 snake 优先于 camel
 		{`{"conversationId":123}`, ""},                                                 // 数字 conversationId → 空
 		{`{"metadata":{"conversationId":456}}`, ""},                                    // metadata 数字 conversationId → 空
-		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 优先于 user_id
+		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 生效（user_id 不再抢占）
+		// 剔除前 user_id 抢占顶层 conversation_id（session.go 旧键序 3 在 4 之前）；
+		// 剔除后顶层 conversation_id 正常生效。
+		{`{"metadata":{"user_id":"mu"},"conversation_id":"top"}`, "top"},
 	}
 	for _, c := range cases {
 		if got := ExtractKey([]byte(c.body)); got != c.want {
@@ -176,6 +180,38 @@ func TestExtractKeyFromRequest(t *testing.T) {
 	req.Header.Set("X-Session-ID", "custom-header-sid")
 	if got := ExtractKeyFromRequest(req, nil); got != "custom-header-sid" {
 		t.Fatalf("expected custom-header-sid from header, got %q", got)
+	}
+}
+
+// TestUserIdNoLongerSticky P1-anti-monopoly：user_id 不再生成粘性——只发
+// metadata.user_id 的客户端 ExtractKey 返回空（无粘性键），handler 侧 gate
+// （sessKey != ""）不成立，Router 不会被咨询，同一 user 的并行对话不再钉同一
+// 账号（回落加权轮换）。键序断言由 TestExtractKeyPriority 覆盖（user_id → ""）。
+func TestUserIdNoLongerSticky(t *testing.T) {
+	bodies := []string{
+		`{"model":"m","metadata":{"user_id":"u-42"},"messages":[]}`,
+		`{"model":"m","metadata":{"user_id":"u-42"},"conversation_id":"c1"}`, // user_id 不再抢占顶层键
+	}
+	for _, body := range bodies {
+		if key := ExtractKey([]byte(body)); key == "" && strings.Contains(body, `"conversation_id":"c1"`) {
+			// 第二条应取 conversation_id（非空）——防御本测试自身的构造错误。
+			t.Fatalf("构造错误：含 conversation_id 的 body 不应返回空: %s", body)
+		}
+	}
+	// 主断言：只发 user_id 的 body 无粘性键。
+	if key := ExtractKey([]byte(bodies[0])); key != "" {
+		t.Fatalf("user_id 不应再生成粘性键, got %q", key)
+	}
+	// conversation 变体不受影响：四种键形态照常提取。
+	for _, body := range []string{
+		`{"conversation_id":"c1"}`,
+		`{"conversationId":"c1"}`,
+		`{"metadata":{"conversation_id":"c1"}}`,
+		`{"metadata":{"conversationId":"c1"}}`,
+	} {
+		if key := ExtractKey([]byte(body)); key != "c1" {
+			t.Errorf("conversation 变体应照常提取: %s got %q", body, key)
+		}
 	}
 }
 

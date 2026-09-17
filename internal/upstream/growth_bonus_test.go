@@ -42,8 +42,15 @@ func (s *bonusStub) handler() http.Handler {
 				return
 			}
 			// 昨日一格 score=0（漏签）+ 今日一格 score=1。
-			yest := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-			today := time.Now().Format("2006-01-02")
+			// 日期标签必须与生产侧同口径（CST 自然日，见 cstShanghai /
+			// GrowthYesterdayDate）：上游 heatmap 的 date 是 CST 自然日，断言侧也用
+			// CST（GrowthYesterdayDate 与 time.Now().In(cstShanghai)）。若此处用进程
+			// 本地时区（容器恒 UTC），则在 UTC 16:00–24:00（= CST 次日 00:00–08:00）
+			// 窗口内标签整体错一天：stub 的"今日"变成被测代码眼中的"昨日"，断言必然
+			// 失败（每天固定 8 小时的时序性红灯，不是偶发抖动）。
+			cstNow := time.Now().In(cstShanghai)
+			yest := cstNow.AddDate(0, 0, -1).Format("2006-01-02")
+			today := cstNow.Format("2006-01-02")
 			fmt.Fprintf(w, `{"code":0,"data":{"cells":[{"date":"%sT00:00:00+08:00","score":0},{"date":"%s","score":1}]}}`, yest, today)
 		case "/activity/growth/streak":
 			// makeup_cards 段（补签卡余额 2）。

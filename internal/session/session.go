@@ -303,9 +303,12 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. metadata.user_id
-//  6. user（OpenAI 标准字段，本地 fork 扩展）
-//  7. messages 首轮特征指纹（系统提示词 + 首条非系统提问的 SHA-256，多轮对话恒定）
+//  5. user（OpenAI 标准字段，本地 fork 扩展）
+//  6. messages 首轮特征指纹（系统提示词 + 首条非系统提问的 SHA-256，多轮对话恒定）
+//
+// 本地 fork 保留 user 与指纹两键；上游曾剔除 metadata.user_id（anti-monopoly，
+// 论证 user 维度粒度过粗）。本地无 metadata.user_id 键（与上游剔除语义一致），
+// 仅保留顶层 user 字段与 messages 指纹作为无 conversationId 客户端的兜底粘性键。
 //
 // issue #35（上游）：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -323,9 +326,6 @@ func ExtractKey(body []byte) string {
 			return v
 		}
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
-			return v
-		}
-		if v := strOrEmpty(meta["user_id"]); v != "" {
 			return v
 		}
 	}

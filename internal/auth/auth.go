@@ -120,9 +120,6 @@ func init() { globalEnabled.Store(true) }
 // SetGlobalEnabled 注入 global realm 路由开关（false = 锁死纯 CN，逃生门）。
 func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
 
-// GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
-func GlobalEnabled() bool { return globalEnabled.Load() }
-
 // Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
 // 否则 "cn"。显式 global 优先于 domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。

@@ -78,6 +78,20 @@ func TestClassify(t *testing.T) {
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
 		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
+		// 429 + 余额措辞 → 限流语义（fork-scan-absorb T-3，本次修复点）：限流响应
+		// body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
+		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+		// 仍归 hardRule（上方 {200,"quota exceeded"} 语义不变）。
+		{429, `quota exceeded`, ErrSoftRate},
+		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+		{429, `insufficient credits`, ErrSoftRate},
+		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
+		{429, `积分不足，请充值`, ErrSoftRate},
+		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
 		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
 		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
 		{403, ``, ErrWafBlock},
@@ -770,8 +784,53 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	// 连接层加固后 New() 的缺省 ResponseHeaderTimeout=60s（详断言见
+	// TestNewTransportHardening；SSE 长流不受影响——该超时只计首包前）。
+	if htr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
+	}
+}
+
+// TestNewTransportHardening 连接层加固配置断言（transport.go 集中参数的回读验证）：
+// 真正禁 h2 / Dial 超时与 keepalive / TLS 握手超时 / ResponseHeaderTimeout 收紧。
+// 挂在 New() 的成品 Transport 上（而非 newTransport() 裸返回）——同一对象同时被
+// HTTP 与 ChatHTTP 持有，任何字段断言都直接对应生产出站行为。
+func TestNewTransportHardening(t *testing.T) {
+	tr, ok := New().ChatHTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type=%T", New().ChatHTTP.Transport)
+	}
+	// 1. 真正禁 h2：TLSNextProto 必须是「非 nil 且不含 h2」的空映射。
+	//    nil = 标准库注入默认 h2 映射（ForceAttemptHTTP2 陷阱，见 transport.go）。
+	if tr.TLSNextProto == nil {
+		t.Fatal("TLSNextProto must be non-nil empty map to disable HTTP/2 (nil = stdlib re-enables h2)")
+	}
+	if _, registered := tr.TLSNextProto["h2"]; registered {
+		t.Error("TLSNextProto must not register h2")
+	}
+	if len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto must be empty, got %d entries", len(tr.TLSNextProto))
+	}
+	// 2. DialContext 超时与 keepalive：无法直接回读 Dialer 字段（Transport 只存
+	//    闭包），行为由 transport_test.go 的拨号计时测试验证。
+	// 3. TLS 握手超时（现役此前缺失）。
+	if tr.TLSHandshakeTimeout != 10*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%v want 10s", tr.TLSHandshakeTimeout)
+	}
+	// 4. ResponseHeaderTimeout 收紧（120s → 60s，语义：只计首包前，SSE 长流不受影响）。
+	if tr.ResponseHeaderTimeout != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", tr.ResponseHeaderTimeout)
+	}
+	// 5. 空闲连接池（既有值，从 90s 收到 30s）。
+	if tr.IdleConnTimeout != 30*time.Second {
+		t.Errorf("IdleConnTimeout=%v want 30s", tr.IdleConnTimeout)
+	}
+	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 20 {
+		t.Errorf("pool sizes=(%d, %d) want (100, 20)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)
+	}
+	// 6. DisableKeepAlives 必须保持 false：与连接复用意图相反，不吸收（报告说明）。
+	if tr.DisableKeepAlives {
+		t.Error("DisableKeepAlives must stay false (keep-alive reuse is intentional)")
 	}
 }
 
@@ -916,4 +975,44 @@ func TestChatHeadersRacesRefreshToken(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestRefreshTokenExpiresInSanityCap expiresIn 量级上限：上游脏值（如
+// 99999999999 秒 ≈ 3170 年）不得把 ExpiresAt 推到荒谬未来（NeedsRefresh 永假
+// → token 永不刷新反而真过期失效）。依据 pr134-watchlist-analysis.md #4 可选加固：
+// 上限 10 年（实测 R-D 响应恒 expiresIn=5184000=60d，10 年是纯防御量级）。
+// 超限按脏值处理：保留旧 ExpiresAt（与缺省分支同语义）。
+func TestRefreshTokenExpiresInSanityCap(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":99999999999}}`), nil
+	})
+	oldExpiry := time.Now().Add(time.Hour).Unix()
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: oldExpiry}
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if a.ExpiresAt != oldExpiry {
+		t.Errorf("脏 expiresIn 应保留旧 ExpiresAt=%d, got %d（被推到荒谬未来）", oldExpiry, a.ExpiresAt)
+	}
+	// token 本身仍应写回（脏 expiresIn 只否决过期时间，不否决凭证）。
+	if a.AccessToken != "newat" || a.RefreshToken != "newrt" {
+		t.Errorf("tokens not updated: %+v", a)
+	}
+}
+
+// TestRefreshTokenExpiresInWithinCapApplied 正常量级（60d，实测 R-D 恒 5184000）
+// 不受上限影响：ExpiresAt 照常推进。
+func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+	before := time.Now().Unix()
+	if err := c.RefreshToken(a); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	want := before + 5184000
+	if a.ExpiresAt < want-2 || a.ExpiresAt > want+2 {
+		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+	}
 }

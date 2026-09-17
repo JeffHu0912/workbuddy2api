@@ -59,8 +59,9 @@ func travelDay(t time.Time) string {
 }
 
 // RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检（无 ctx 的外部入口：
-// cmd/手动触发、测试）。内部走 runTravel，取背景 ctx（不可取消，语义与
-// 引入前 time.Sleep 版一致）。
+// 测试与潜在的手动触发——cmd 侧从未接线，不存在 cmd/travel 入口，部署验证
+// 场景由 RunActivityNow 覆盖）。内部走 runTravel，取背景 ctx（不可取消，
+// 语义与引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunTravelNow() {
 	s.runTravel(context.Background())
 }

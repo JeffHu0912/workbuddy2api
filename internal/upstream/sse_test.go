@@ -918,7 +918,7 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 						continue
 					}
 					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
+						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" && em["code"] == "upstream_parse" {
 							found = true
 						}
 					}
@@ -1010,5 +1010,29 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 				t.Errorf("frame not normalized: %q", body)
 			}
 		})
+	}
+}
+
+// TestAggregateNonDeltaMessageContentNotDuplicated 上游把**完整消息**放在 choices[].message
+// （非 delta）且每帧都带时，内容不得被逐帧重复追加。
+//
+// 缺陷：`!gotAnyContent` 守卫的 message 回退分支写入了 content 却从未置 gotAnyContent=true，
+// 守卫永不latch——对「每帧都带完整 message」的上游（正是该分支注释所描述的形态），
+// 聚合结果里 message 正文会重复 N 遍（N = 帧数）。
+//
+// 断言：三帧各带完整 message（delta 无 content）→ content 恰为该文本一份。
+// 修复前得到 "abcabcabc" → RED。
+func TestAggregateNonDeltaMessageContentNotDuplicated(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"abc\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":3}}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "abc" {
+		t.Errorf("content=%q want %q（message 回退分支应只采一次）", msg["content"], "abc")
 	}
 }

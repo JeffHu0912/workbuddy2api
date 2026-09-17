@@ -4,6 +4,7 @@ package upstream
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,17 @@ import (
 	"strings"
 	"time"
 )
+
+// errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
+// 用哨兵错误替代裸 fmt.Errorf：StreamHint 的调用方（handler 流式路径）需要区分
+// 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
+// 客户端已走，日志口径不同。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
+var errEmptyStream = errors.New("upstream stream contained no valid data events")
+
+// IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
+// 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
+// upstream_parse 同语义），与客户端断连类错误区分。
+func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
@@ -187,7 +199,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if validEvents == 0 {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
-		return nil, fmt.Errorf("upstream stream contained no valid data events")
+		return nil, errEmptyStream
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -442,7 +454,19 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
 // 调用方必须先设置过 status 200；本函数自设 SSE headers。
 // 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
+//
+// StreamHint 变体（gateway_hint 任务）：上游 error 帧透传时附加
+// error.gateway_hint 字段——message 原文不动，hint 并列补充；hintFn 返回空串
+// 或 nil 时与 Stream 行为逐字节一致。
 func Stream(w http.ResponseWriter, r io.Reader) error {
+	return StreamHint(w, r, nil)
+}
+
+// StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
+// error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
+// 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
+// 未覆盖，不编造）。
+func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -461,7 +485,13 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）并 flush。上游 error 帧（error-passthrough）
 	// 与空流错误帧需保留 error 字段，不能被白名单剥掉，故经此写出。
+	// gateway_hint：上游 error 帧透出前按 hintFn 附加 error.gateway_hint 字段
+	// （error 对象上加一个键，message/code/requestId 等原文不动；hintFn 为
+	// nil / 空串 / 非 JSON 帧 → 原样写出，零改写）。
 	writeRaw := func(payload string) error {
+		if hint := frameGatewayHint(hintFn, payload); hint != "" {
+			payload = attachHintToErrorFrame(payload, hint)
+		}
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
@@ -550,8 +580,10 @@ readLoop:
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
+	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
+	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
 	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
+		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
@@ -561,7 +593,37 @@ readLoop:
 		fl.Flush()
 	}
 	if validFrames == 0 {
-		return fmt.Errorf("upstream stream contained no valid data events")
+		return errEmptyStream
 	}
 	return nil
+}
+
+// frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。
+func frameGatewayHint(hintFn func(string) string, payload string) string {
+	if hintFn == nil {
+		return ""
+	}
+	// panic 隔离：hint 判定是补充功能，任何实现缺陷不得击穿流透传主路径。
+	defer func() { _ = recover() }()
+	return strings.TrimSpace(hintFn(payload))
+}
+
+// attachHintToErrorFrame 在 error 帧的 error 对象上附加 gateway_hint 字段。
+// message/code/requestId 等既有键原样保留（只加不改）；非 JSON / 无 error 对象 →
+// payload 原样返回（宁可不加 hint 也不破坏原文透传）。
+func attachHintToErrorFrame(payload, hint string) string {
+	var obj map[string]any
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		return payload
+	}
+	e, ok := obj["error"].(map[string]any)
+	if !ok {
+		return payload
+	}
+	e["gateway_hint"] = hint
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return string(out)
 }

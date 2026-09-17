@@ -12,6 +12,9 @@ import (
 func TestNoteModelCostAndPreferFree(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "free"})
 	p.Add(&auth.Auth{UID: "paid"})
@@ -34,6 +37,9 @@ func TestNoteModelCostAndPreferFree(t *testing.T) {
 func TestModelCostCheaperPaidWins(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "cheap"})
 	p.Add(&auth.Auth{UID: "pricey"})
@@ -53,6 +59,9 @@ func TestModelCostCheaperPaidWins(t *testing.T) {
 func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "unknown"})
 	p.Add(&auth.Auth{UID: "paid"})
@@ -72,6 +81,9 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 func TestModelCostFreeBeatsUnknown(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
+	// 探索关停前置（issue #136）：本测试锚定「无探索义务时的成本优先语义」，
+	// 层序语义不变，显式关停新增的 costTier 探索维度（设计报告 §4 T9）。
+	p.SetCostExploreInterval(0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.Add(&auth.Auth{UID: "knownfree"})
 	p.Add(&auth.Auth{UID: "unknown"})
