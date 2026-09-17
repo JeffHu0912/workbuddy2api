@@ -175,7 +175,6 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
 								mergeMessageFields(msg)
 							}
-							}
 						}
 					}
 				}
