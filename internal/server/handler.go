@@ -643,7 +643,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.UID8(acct.UID), err)
+				log.Printf("ERR: [server] chat refresh uid=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 			}
 		}
 
@@ -746,7 +746,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
-				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			rc.Close()
 			return

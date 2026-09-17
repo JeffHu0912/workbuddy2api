@@ -221,7 +221,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	return best.a
 }

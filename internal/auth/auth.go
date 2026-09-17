@@ -292,15 +292,15 @@ func LoadDir(dir string) ([]*Auth, error) {
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
-				logfmt.UID8(a.UID), prev, f)
+				logfmt.Label(a.UID, a.Nickname), prev, f)
 		}
 		seenUID[a.UID] = f
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
 				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
+					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
 				}
 			}
 		}
