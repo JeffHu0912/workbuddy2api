@@ -127,6 +127,11 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	return p
 }
 
+// errReader 固定返回 err 的 io.Reader：模拟客户端发送 body 中途断流。
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
 // assertJSONErrorCode 断言响应体是 OpenAI 风格 error 信封且 code 精确等于 want。
 func assertJSONErrorCode(t *testing.T, body, want string) bool {
 	t.Helper()
@@ -146,86 +151,56 @@ func assertJSONErrorCode(t *testing.T, body, want string) bool {
 	return true
 }
 
-// TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
-func TestChatBodyLimitExactAllowed(t *testing.T) {
+// TestChatLargeBodyProceeds 无请求体大小上限（max_body_mb 已移除）：任意大 body 完整
+// 读入并正常进入后续处理（打到上游），网关侧不再 413 预拦截。超限类问题交由上游
+// 自然返回错误（错误响应经既有分类链路透出，信息量更大），网关不挡上游真实行为。
+func TestChatLargeBodyProceeds(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)) // 恰好 100 字节
-	if body := prefix + pad + suffix; len(body) != 100 {
-		t.Fatalf("fixture len=%d want 100", len(body))
-	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	// 远超旧 8MB 默认上限的合法 JSON body（50MB+）：必须完整读入、照常进上游。
+	pad := strings.Repeat("a", 50<<20)
+	var b bytes.Buffer
+	b.WriteString(`{"model":"glm-5.2","messages":[],"pad":"`)
+	b.WriteString(pad)
+	b.WriteString(`"}`)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b.Bytes())))
 	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (exactly-at-limit body must proceed)", rec.Code, rec.Body)
+		t.Fatalf("code=%d body=%s (oversized body must proceed to upstream, no 413)", rec.Code, rec.Body)
 	}
 	if calls != 1 {
-		t.Errorf("upstream calls=%d want 1", calls)
-	}
-}
-
-// TestChatOversizedBodyReturns413 请求体超过上限 → 直接 413 request_body_too_large：
-// 不打上游（calls=0）、不罚账号（无冷却/无熔断计数/无禁用）、不轮转。
-func TestChatOversizedBodyReturns413(t *testing.T) {
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		return 200, sseOK, true
-	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	// 101 字节 > 100 上限。
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)+1)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d body=%s want 413", rec.Code, rec.Body)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "request_body_too_large") {
-		t.Errorf("body should carry request_body_too_large: %s", body)
-	}
-	if !strings.Contains(body, "server.max_body_mb") {
-		t.Errorf("413 message should name config key server.max_body_mb: %s", body)
-	}
-	if calls != 0 {
-		t.Errorf("upstream must not be called on 413, got %d", calls)
+		t.Errorf("upstream calls=%d want 1 (large body must reach upstream)", calls)
 	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
-		t.Errorf("413 must not penalize account: %+v", st)
+		t.Errorf("large body must not penalize account: %+v", st)
 	}
 }
 
-// TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
-// 8MB+1 的请求体必须 413（不再静默截断喂给上游，issue #41 根因）。
-func TestChatOversizedBodyDefaultLimit(t *testing.T) {
+// TestChatReadBodyErrorReturns400 客户端断流（读 body 出错）→ 400 invalid_request：
+// 这是 #41 截断防御语义的保留形态——移除预拦截后，截断只可能来自客户端自己断流，
+// 读错误在网关侧就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 罚号。
+func TestChatReadBodyErrorReturns400(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 8MB
-
-	body := make([]byte, 8<<20+1) // 8MB+1
-	copy(body, `{"model":"glm-5.2","messages":[]}`)
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (8MB+1 must be rejected)", rec.Code)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", errReader{errors.New("client reset")}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (read error)", rec.Code)
 	}
+	assertJSONErrorCode(t, rec.Body.String(), "invalid_request")
 	if calls != 0 {
-		t.Errorf("upstream must not be called, got %d", calls)
+		t.Errorf("upstream must not be called on read error, got %d", calls)
 	}
 }
 
@@ -923,6 +898,37 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	stGood, _ := p.Status("good")
 	if stGood.Cooling || stGood.Disabled {
 		t.Errorf("good should stay healthy: %+v", stGood)
+	}
+}
+
+func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14018,"msg":"Credits exhausted"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000)
+	p.SetCredits("good", 1000)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	st, ok := p.Status("bad")
+	if !ok || !st.Cooling {
+		t.Fatalf("14018 account should be cooling: %+v ok=%v", st, ok)
+	}
+	if st.Reason != "余额不足" || st.Until.Hour() != 4 {
+		t.Fatalf("14018 should use hard-credit cooldown, got reason=%q until=%v", st.Reason, st.Until)
+	}
+	if got := p.Pick(""); got == nil || got.UID != "good" {
+		t.Fatalf("hard-cooled 14018 account must not be fallback-picked, got %+v", got)
 	}
 }
 
@@ -2686,10 +2692,10 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
 		t.Fatalf("outbound body should be append-rewritten: %s", bodies[0])
 	}
 	// 聚合键按原始 body 派生（改写前提取）。
-	// 本地 fork 扩展：ExtractKey 对带 messages 的 body 会派生 messages 指纹
-	// （非空 sessKey），handler 走 RequestIDForKey(sessKey) 分支；无指纹时才走
-	// turnKey 兜底。两条路径都在改写前提取，本断言按 handler 实际路径对齐。
-	want := session.RequestIDForKey(session.ExtractKey([]byte(original)))
+	// 本 body 无 conversationId/metadata → ExtractKey 返回空（sessKey 为空），
+	// handler 走 turnKey 兜底分支 ConversationRequestID = TurnRequestID(TurnKey(原))。
+	// 键在改写前提取，故本断言按 handler 实际路径对齐（不依赖已移除的本地指纹键）。
+	want := session.TurnRequestID(session.TurnKey([]byte(original)))
 	if want == "" {
 		t.Fatal("want non-empty RequestID for original body")
 	}

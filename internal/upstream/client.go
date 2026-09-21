@@ -37,6 +37,7 @@ const (
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -64,6 +65,8 @@ func (k ErrKind) String() string {
 		return "waf_block"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
+	case ErrImageInvalid:
+		return "image_invalid"
 	case ErrClient:
 		return "client"
 	default:
@@ -182,6 +185,19 @@ var badParamsRule = errorRule{kind: ErrBadParams, mode: matchExact, patterns: []
 	`"code":11101`,
 }}
 
+// invalidImageRule 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
+// 请求内容决定，不是账号问题：换账号不会改变同一 body 的解析结果。上游常见形态包括
+// `Parse message failed: invalid image_url content`、invalid_image_data、
+// `replace the image`。
+//
+// 业务码 11135 不放在这里：code 判定必须容忍 JSON 空白（`"code": 11135`），
+// 字面量 marker 只能覆盖紧凑形态，故统一走 codeMarker（见 Classify 的 400 分支）。
+var invalidImageRule = errorRule{kind: ErrImageInvalid, mode: matchFold, patterns: []string{
+	"invalid image_url content",
+	"invalid_image_data",
+	"replace the image",
+}}
+
 // alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
@@ -244,7 +260,8 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 const modelRateLimitCode = "6004"
 
 // softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+const softRateResetPatternCN = `将在 (.+?) 重置`
+const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`
 
 // 限流判定正则预编译为包级 var（发现 8）：IsModelRateLimit / ParseRateReset
 // 在每次错误分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；
@@ -252,7 +269,8 @@ const softRateResetPattern = `将在 (.+?) 重置`
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
 	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
+	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
@@ -319,6 +337,38 @@ func IsModelBlocked(status int, body string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+}
+
+// hasBusinessCode reports whether a JSON error envelope contains an exact
+// business code in a field named "code". Upstream envelopes vary between
+// top-level and nested error/data objects, so walk the decoded structure.
+func hasBusinessCode(body, want string) bool {
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+				return true
+			}
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root)
 }
 
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
@@ -428,7 +478,10 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
-	m := reSoftRateReset.FindStringSubmatch(body)
+	m := reSoftRateResetCN.FindStringSubmatch(body)
+	if len(m) < 2 {
+		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -457,28 +510,31 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     soft_rate（"限流"语义不符：限流可指数退避等自愈，账号级故障等不来）。
 //     11140 的 model 级限流变体（rate-limiting 文案）因 marker 不含该文案而天然
 //     不在此层命中，后续走 softRateRule 层，不受影响。
-//  4. status==429 —— 限流状态码兜底（本层先于 hardRule，fork-scan-absorb T-3）：
+//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
+//     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
+//  5. status==429 —— 限流状态码兜底（本层先于 hardRule，fork-scan-absorb T-3）：
 //     429 body 高频携带 "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，
 //     若 hardRule 先判会把限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约
 //     12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流语义处理
-//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）捕获，
+//     （宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（第 1 层）或
+//     14018（第 4 层）捕获，
 //     非 429 状态码的 quota 措辞仍走下方 hardRule（第 5 层）。
-//  5. hardRule —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  6. hardRule —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
 //     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit；429 场景已由
-//     第 4 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
+//     第 5 层前置接管（issue #28 记录的非 429 反向误判风险保持原样，待上游
 //     原始响应确认后再定）。
-//  6. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
-//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 4 层
+//  7. softRateRule —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     位于此处可覆盖 200/400/403/5xx 各状态码；429 且 body 含文案时已被第 5 层
 //     短路，结果同为 soft_rate。
-//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  8. 404 / 5xx —— 与限流无关的常规分类。
-//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态（WAF 403 修复 P0-1）。判在通用 4xx 兜底**之前**：此前该形态落
 //     ErrClient → applyErrorPolicy 只换号不罚 → 连环 403（报告 §4.1 的根因）。
 //     带业务信封的 403 已被上方各层捕获（11140 request illegal →
 //     ErrAccountFault 禁用语义不变），走不到本层。
-//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
@@ -502,7 +558,13 @@ func Classify(status int, body string) ErrKind {
 	if accountFaultRule.hit(body, lower) {
 		return ErrAccountFault
 	}
-	// status==429 先于 hardRule（fork-scan-absorb T-3，本次修复点）：限流响应 body
+	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
+	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
+	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+		return ErrHardCredit
+	}
+	// status==429 先于 hardRule（fork-scan-absorb T-3）：限流响应 body
 	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
 	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
 	// 措辞仍走下方 hardRule，历史语义不变。
@@ -535,6 +597,14 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
+	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
+	// 业务码 11135 经 codeMarker 而非字面量 marker：上游 JSON 含空白
+	// （`"code": 11135`）时字面量 marker 会漏判，导致退化成 ErrClient 并继续轮转。
+	// 口径与 hint.go 的 isInvalidImageData（同样用 codeMarker）一致。
+	if status == http.StatusBadRequest && (invalidImageRule.hit(body, lower) || codeMarker(lower, "11135")) {
+		return ErrImageInvalid
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
@@ -984,14 +1054,8 @@ func jwtExpDate(tok string) string {
 	return time.Unix(claims.Exp, 0).Format("2006-01-02")
 }
 
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
-const (
-	chatCompletionsPath   = "/v2/chat/completions"
-	globalChatConsolePath = "/console/chat/completions"
-)
-
-// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
+// 路径常量：CN 与 global 共用的 chat 出站路径（/v2 单路径）。
+const chatCompletionsPath = "/v2/chat/completions"
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
@@ -1000,8 +1064,11 @@ func chatFallbackHTTPStatus(status int) bool { return status == 404 || status ==
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// global chat 自 #119 实测后固定走 /v2（/console 挂腾讯云 WAF body 内容规则，
+// 反引号 printf/whoami 等命令执行特征确定性 403；/v2 同 base 不挂该规则，实测等价端点）。
+// 已知取舍：若上游未来关闭 /v2，global chat 将整体不可用——届时应重新启用 /console
+// 路径（含 WAF 特征中和，见 issue #119 / pr162-review.md）。本注释即"坏了再说"的锚点。
+// cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
@@ -1020,8 +1087,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+	// ensureConsoleSystem 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置
+	// 兜底 system（防 console 域上游 code 11-128；#119 后 global 出站固定 /v2，
+	// 该兜底保留——上游对 /v2 是否需要 system 无实测反证，删了无回滚路径）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
@@ -1029,7 +1097,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
-	for attempt, path := range c.chatPaths(a) {
+	for _, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 		if err != nil {
@@ -1063,10 +1131,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
-				continue
-			}
+			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链；billing 层的
+			// 404 fallback 独立存在，语义不受影响）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
@@ -1087,11 +1153,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 }
 
 // chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
+// global → [/v2]（#119 固定单路径，见 ChatStreamContext 头注释）；cn → [/v2]（单元素，现状）。
 func (c *Client) chatPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
-	}
 	return []string{chatCompletionsPath}
 }
 

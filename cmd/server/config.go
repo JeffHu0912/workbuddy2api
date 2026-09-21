@@ -20,13 +20,7 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
-		// 请求体超过该值直接返回 413 request_body_too_large，不再静默截断后喂给上游
-		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
-		// 0/负数视为非法 → normalize 回落默认并记录。
-		MaxBodyMB int `json:"max_body_mb"`
-	} `json:"server"`
+	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -39,6 +33,14 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule config.Schedule `json:"schedule"`
+
+	// Admin 运维管理端点开关（issue #138/#118）。默认**关闭**：管理能力默认不暴露，
+	// 避免「开了网关就等于开了账号管理面」。开启后
+	// /admin/accounts/{uid}/{disable,enable,revive} 可用；鉴权与 /status 同源
+	// （withAuth + 同一个 api_key，不另立管理密钥）。
+	Admin struct {
+		Enabled bool `json:"enabled"` // 默认 false
+	} `json:"admin"`
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
@@ -169,7 +171,6 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -241,11 +242,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
-	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Server.MaxBodyMB = n
-		}
-	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -304,15 +300,15 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.Enabled = b
+		}
+	}
 }
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
-	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
-	if c.Server.MaxBodyMB <= 0 {
-		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
-	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
@@ -399,6 +395,13 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// fail-fast（设计 supplement §4.1）：admin.enabled=true 且 api_key 为空 = 未鉴权的
+	// mutation 端点（disable/revive 是可用性操作，风险高于 /status 读泄漏），拒绝启动。
+	// 校验放 applyEnv 之后：env 覆盖（WB2A_ADMIN_ENABLED / WB2A_API_KEY）与 config
+	// 两条入口最终状态一致拦截。
+	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("admin.enabled=true 但 api_key 为空：请设置 api_key 或将 admin.enabled 置 false")
 	}
 	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）
 	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
