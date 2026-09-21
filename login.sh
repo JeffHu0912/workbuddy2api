@@ -15,9 +15,11 @@
 #   4. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
 #   5. 重启 workbuddy2api 容器加载新账号
 #
-# 号池选择（2026-09-16 分池后）：--pool=phone（默认）| --pool=qq
+# 号池选择（2026-09-16 分池后）：--pool=phone（默认）| --pool=qq | --pool=hk
 #   phone → 落盘 ./auths/、重启 workbuddy2api、探活 :7863（config.json）
 #   qq    → 落盘 ./auths-qq/、重启 workbuddy2api-qq、探活 :7865（config-qq.json）
+#   hk    → 落盘 ./auths-hk/、重启 workbuddy2api-hk、探活 :7866（config-hk.json）；
+#            realm 与 phone/qq 池同口径（走 CN 注册地址）
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -26,12 +28,13 @@ CONTAINER="workbuddy2api"
 PORT=7863
 CFG="config.json"
 
-# ─── 号池选参：--pool=phone|qq（不与其他 --realm 传参冲突）──────────
+# ─── 号池选参：--pool=phone|qq|hk（不与其他 --realm 传参冲突）──────────
 POOL="phone"
 for arg in "$@"; do
     case "$arg" in
         --pool=phone) POOL="phone" ;;
         --pool=qq)    POOL="qq" ;;
+        --pool=hk)    POOL="hk" ;;
     esac
 done
 if [[ "$POOL" == "qq" ]]; then
@@ -40,6 +43,12 @@ if [[ "$POOL" == "qq" ]]; then
     PORT=7865
     CFG="config-qq.json"
     echo "（号池: qq → $AUTH_DIR / $CONTAINER / :$PORT）"
+elif [[ "$POOL" == "hk" ]]; then
+    AUTH_DIR="./auths-hk"
+    CONTAINER="workbuddy2api-hk"
+    PORT=7866
+    CFG="config-hk.json"
+    echo "（号池: hk → $AUTH_DIR / $CONTAINER / :$PORT）"
 fi
 
 mkdir -p "$AUTH_DIR" 2>/dev/null || true
@@ -61,6 +70,7 @@ fi
 # ─── realm 选域：--realm=cn|global 传参优先（跳过询问）──────────────
 # 无传参：stdin 是 tty → 交互式选域（login realm 子命令负责提示+读数，go 侧逻辑可测）；
 #         非交互（管道/cron，[ -t 0 ] 为假）→ 回落默认 cn 并提示。
+# hk 池与 phone/qq 池同口径：不强制 realm，按传参/交互/回落默认走（默认 cn）。
 REALM=""
 if [[ $# -gt 0 && "$1" == --realm=* ]]; then
     REALM="${1#--realm=}"

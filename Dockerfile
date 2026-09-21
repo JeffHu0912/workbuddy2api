@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+# 国内 Go 模块镜像：构建容器内 127.0.0.1 访问不到宿主机代理，GOPROXY 直连更稳更快
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod ./
 RUN go mod download
 COPY . .

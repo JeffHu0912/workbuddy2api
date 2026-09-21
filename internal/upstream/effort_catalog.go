@@ -35,7 +35,7 @@ var cnEffortFallback = map[string]effortCap{
 	"glm-5.2":             {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
 	"glm-5.1":             {efforts: []string{"medium"}},
 	"glm-5v-turbo":        {efforts: []string{"medium"}},
-	"kimi-k3-1":           {efforts: []string{"medium"}},
+	"kimi-k3-1":           {efforts: []string{"low", "high", "xhigh"}, defaultEffort: "high"},
 	"kimi-k2.7":           {efforts: []string{"medium"}},
 	"kimi-k2.6":           {efforts: []string{"medium"}},
 	"minimax-m3":          {efforts: []string{"medium"}},

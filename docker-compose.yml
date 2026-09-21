@@ -42,25 +42,6 @@ services:
     networks:
       - ai-mesh
 
-  # ─── QQ 号池（第二实例）────────────────────────────────────────────
-  # 与手机号池物理隔离：独立 auths-qq/ + data-qq/ + config-qq.json + 端口 7865。
-  # 同一镜像 project-workbuddy2api，仅挂载卷与配置不同；ENTRYPOINT 固定读
-  # /app/config.json，故把 config-qq.json 挂载覆盖到该路径。
-  wb2api-qq:
-    image: project-workbuddy2api
-    container_name: workbuddy2api-qq
-    restart: unless-stopped
-    environment:
-      - TZ=Asia/Shanghai
-    ports:
-      - "7865:7865"
-    volumes:
-      - ./auths-qq:/app/auths
-      - ./data-qq:/app/data
-      - ./config-qq.json:/app/config.json:ro
-    networks:
-      - ai-mesh
-
 networks:
   ai-mesh:
     external: true
