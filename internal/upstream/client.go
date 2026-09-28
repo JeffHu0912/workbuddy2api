@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -201,7 +202,10 @@ var invalidImageRule = errorRule{kind: ErrImageInvalid, mode: matchFold, pattern
 // alreadyCheckinRule "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already"}}
+// 关键词覆盖（借鉴 WBCenter IsAlreadyCheckedIn）："已签到"/"already" 为实测主流文案；
+// "签到过" 覆盖 "今天签到过了" 变体；"code=10001" 兜底 msg 缺文案但带业务码的形态
+//（*Error.Msg 由 doJSON 拼为 "code=%d msg=%s"，故该串能命中）。
+var alreadyCheckinRule = errorRule{mode: matchFold, patterns: []string{"已签到", "already", "签到过", "code=10001"}}
 
 // accountFaultRule 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
@@ -895,6 +899,29 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 	return []string{dailyCheckinPathV2}
 }
 
+// describeBody 把上游 HTTP 错误响应体转成可操作的错误文案（借鉴 WBCenter）。
+//
+// 上游在网关层（openresty/apisix）拦截时返回的是 HTML 错误页而不是 JSON 信封，
+// 直接把 HTML 塞进 Error.Msg 会让日志/面板挂满标签且看不出处置方向；这里识别
+// HTML 后换成人话并给出处置建议（401/403 通常意味着 token 失效）。非 HTML 保持
+// 原样截断——不改变 Classify 的分类语义（分类在调用前已用原始 body 完成），
+// 只优化 *Error.Msg 的可读性。
+func describeBody(status int, body string) string {
+	trimmed := strings.TrimSpace(body)
+	looksHTML := strings.HasPrefix(trimmed, "<") || strings.Contains(strings.ToLower(trimmed), "<html")
+	if looksHTML {
+		switch status {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "上游网关拒绝授权（HTML 错误页，token 可能已失效，请刷新或重新登录）"
+		case http.StatusNotFound:
+			return "上游接口不存在（HTML 错误页，域名或路径可能已变更）"
+		default:
+			return "上游网关返回了非 JSON 的 HTML 错误页"
+		}
+	}
+	return truncate(body, 200)
+}
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
@@ -909,8 +936,9 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode >= 400 {
-		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		body := string(raw)
+		kind := Classify(resp.StatusCode, body)
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: describeBody(resp.StatusCode, body)}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -1588,6 +1616,7 @@ type userResourceResp struct {
 		Data struct {
 			TotalDosage int64 `json:"TotalDosage"`
 			Accounts    []struct {
+				PackageCode         string `json:"PackageCode"` // 套餐编号，free-packages 切片查询的入参
 				PackageName         string `json:"PackageName"`
 				CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 				CapacitySize        int64  `json:"CapacitySize"`
@@ -1664,6 +1693,177 @@ func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs 
 		}
 	}
 	return remain, used, size, packs, nil
+}
+
+// PackageCodes 提取账号全部有效套餐编号（去重、保序），供 DailyFreePackages 查询
+// 今日套餐切片。借自 get-user-resource 响应（与 ResourceSummary 同一份数据），
+// 不额外发请求。
+func (c *Client) PackageCodes(a *auth.Auth) ([]string, error) {
+	resp, err := c.getUserResourceBody(a)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(resp.Response.Data.Accounts))
+	codes := make([]string, 0, len(resp.Response.Data.Accounts))
+	for _, acct := range resp.Response.Data.Accounts {
+		code := strings.TrimSpace(acct.PackageCode)
+		if code == "" || seen[code] {
+			continue
+		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return codes, nil
+}
+
+// DailyPackage 上游「今日套餐切片」：当日该套餐的发放/已用/剩余配额。
+// 这是配额口径，不是交易流水——上游按天切窗返回，与签到/消耗实时联动。
+type DailyPackage struct {
+	Code      string  `json:"code"`      // 套餐编号
+	Name      string  `json:"name"`      // 套餐名
+	Total     float64 `json:"total"`     // 今日发放
+	Used      float64 `json:"used"`      // 今日已用
+	Remaining float64 `json:"remaining"` // 今日剩余
+}
+
+// freePackagesPath 今日套餐切片端点。注意与 get-user-resource/daily-checkin 不同：
+// 该端点 CN/global **均无 /v2 前缀**（WBCenter 实测，其 workbuddy.ai 域也走此前缀），
+// 故不进 billingMeterPaths 的 404 fallback 候选族，固定单路径。
+const freePackagesPath = "/billing/meter/get-user-resource-free-packages"
+
+// DailyFreePackages 查询账号当日各套餐的发放/已用/剩余切片（借鉴 WBCenter
+// DailyFreePackages，端点/字段口径与其对齐）。
+//
+// 要点：
+//   - 请求窗为本地自然日 [00:00, 23:59:59.999]，PackageCodes 来自 PackageCodes()；
+//   - 取值优先行内 SlicePeriodUsageDetails[0] 嵌套数组（部分账号形态），缺失回退
+//     行级 CycleCapacity*；每维都先试 *Precise 高精度字段再试普通字段；
+//   - total==0 时用 remain+used 兜底；used==0 且 total>remain 时用 total-remain 兜底；
+//   - domain 为 workbuddy.cn 的账号强制改写 billing base（WBCenter 兼容分支：
+//     该域按旧代码会落到 CN base，但上游实际只在自有域提供切片）。
+func (c *Client) DailyFreePackages(a *auth.Auth, packageCodes []string) ([]DailyPackage, error) {
+	if len(packageCodes) == 0 {
+		return nil, fmt.Errorf("上游未返回可查询的套餐编号")
+	}
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	end := start.Add(24*time.Hour - time.Millisecond)
+	body := map[string]any{
+		"PageNumber": 1, "PageSize": 200, "Status": []int{0, 3},
+		"PackageCodes":         packageCodes,
+		"SlicePeriodStartTime": start.Format(packageEndLayout),
+		"SlicePeriodEndTime":   end.Format(packageEndLayout),
+	}
+	raw, err := c.billingJSONBase(a, http.MethodPost, freePackagesPath, body, c.freePackagesBase(a))
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, fmt.Errorf("每日套餐响应解析失败: %w", err)
+	}
+	rows := findPackageRows(decoded)
+	out := make([]DailyPackage, 0, len(rows))
+	for _, row := range rows {
+		values := row
+		if details, ok := row["SlicePeriodUsageDetails"].([]any); ok && len(details) > 0 {
+			if first, ok := details[0].(map[string]any); ok {
+				values = first
+			}
+		}
+		// 部分账号返回 SlicePeriodUsageDetails 嵌套数组，部分把同样的值平铺在
+		// 行级 CycleCapacity*——两种形态都要兼容；*Precise 优先（小数精度）。
+		total := firstFloat(values, "SlicePeriodCapacitySizePrecise", "SlicePeriodCapacitySize", "CycleCapacitySizePrecise", "CycleCapacitySize")
+		remain := firstFloat(values, "SlicePeriodCapacityRemainPrecise", "SlicePeriodCapacityRemain", "CycleCapacityRemainPrecise", "CycleCapacityRemain")
+		used := firstFloat(values, "SlicePeriodCapacityUsedPrecise", "SlicePeriodCapacityUsed", "CycleCapacityUsedPrecise", "CycleCapacityUsed")
+		if total == 0 {
+			total = remain + used
+		}
+		if used == 0 && total > remain {
+			used = total - remain
+		}
+		out = append(out, DailyPackage{
+			Code:      firstText(row, "PackageCode", "packageCode"),
+			Name:      firstText(row, "PackageName", "packageName"),
+			Total:     total, Used: used, Remaining: remain,
+		})
+	}
+	return out, nil
+}
+
+// freePackagesBase 解析 free-packages 的 billing base（含 workbuddy.cn 兼容改写）。
+// 与 billingBase 的差异仅在 workbuddy.cn 域：该域按 realm 判定落 CN base，但上游
+// 实际只在自有域提供当日切片，需强制改写（WBCenter 兼容分支）。
+func (c *Client) freePackagesBase(a *auth.Auth) string {
+	base := c.billingBase(a)
+	domain := strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(a.DomainValue())), "https://"), "http://")
+	if domain == "workbuddy.cn" || domain == "www.workbuddy.cn" {
+		base = "https://www.workbuddy.cn"
+	}
+	return base
+}
+
+// findPackageRows 在 free-packages 响应里定位套餐行数组（兼容 Accounts/Packages
+// 大小写多种信封嵌套）。
+func findPackageRows(v any) []map[string]any {
+	if x, ok := v.(map[string]any); ok {
+		for _, k := range []string{"Accounts", "accounts", "Packages", "packages"} {
+			if raw, ok := x[k].([]any); ok {
+				out := make([]map[string]any, 0, len(raw))
+				for _, item := range raw {
+					if row, ok := item.(map[string]any); ok {
+						out = append(out, row)
+					}
+				}
+				return out
+			}
+		}
+		for _, child := range x {
+			if rows := findPackageRows(child); rows != nil {
+				return rows
+			}
+		}
+	}
+	return nil
+}
+
+// firstFloat 按序取第一个非零数值字段（兼容 float64/json.Number/string 三种形态）。
+func firstFloat(row map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		if v, ok := row[k]; ok {
+			if n := asFloat(v); n != 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// asFloat 把 JSON 解码出的 any 数值统一成 float64。
+func asFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f
+	}
+	return 0
+}
+
+// firstText 按序取第一个非空字符串字段。
+func firstText(row map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := row[k]; ok {
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" && s != "<nil>" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（与 cmd/credit resourcePackage 同构）。

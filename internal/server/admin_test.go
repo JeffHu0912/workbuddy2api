@@ -7,12 +7,14 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // adminResp 与 adminState 同构（测试侧独立声明，避免测试跟着实现改字段名）。
@@ -272,5 +274,82 @@ func TestAdminStatusExposesManualDisabled(t *testing.T) {
 	// 计数口径：手动停用归入 disabled（与自动禁用同类）
 	if body.Disabled != 1 || body.Healthy != 0 {
 		t.Errorf("counts disabled=%d healthy=%d, want 1/0", body.Disabled, body.Healthy)
+	}
+}
+
+// ============================================================================
+// adminCredits：今日套餐切片聚合（借鉴 WBCenter）。
+// ============================================================================
+
+// creditsUpstreamStub 桩上游：get-user-resource 返回余额+套餐码，free-packages
+// 返回当日切片。两接口都走同一 testServer。
+func creditsUpstreamStub(t *testing.T) (*upstream.Client, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource"):
+			fmt.Fprint(w, `{"code":0,"data":{"Response":{"Data":{"TotalDosage":5000,"Accounts":[
+				{"PackageCode":"pkg_daily","PackageName":"每日包","CycleCapacitySize":1000,"CycleCapacityRemain":700,"CycleCapacityUsed":300}
+			]}}}}`)
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-free-packages"):
+			fmt.Fprint(w, `{"code":0,"data":{"Accounts":[
+				{"PackageCode":"pkg_daily","PackageName":"每日包",
+				 "SlicePeriodUsageDetails":[{"SlicePeriodCapacitySizePrecise":100,"SlicePeriodCapacityUsedPrecise":42.5,"SlicePeriodCapacityRemainPrecise":57.5}]}
+			]}}`)
+		default:
+			http.Error(w, `{"code":404,"msg":"no stub"}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	up := upstream.New()
+	up.BillingBaseCN = srv.URL
+	return up, srv
+}
+
+func TestAdminCreditsDailyPackages(t *testing.T) {
+	up, _ := creditsUpstreamStub(t)
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	p := testPoolWith(a)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin/api/credits", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var body struct {
+		Accounts []struct {
+			UID    string `json:"uid"`
+			Remain int64  `json:"remain"`
+			Daily  []struct {
+				Code      string  `json:"code"`
+				Name      string  `json:"name"`
+				Total     float64 `json:"total"`
+				Used      float64 `json:"used"`
+				Remaining float64 `json:"remaining"`
+			} `json:"daily"`
+			DailyError string `json:"daily_error"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body)
+	}
+	if len(body.Accounts) != 1 {
+		t.Fatalf("accounts=%d", len(body.Accounts))
+	}
+	acct := body.Accounts[0]
+	if acct.Remain != 700 {
+		t.Errorf("remain=%d want 700", acct.Remain)
+	}
+	if acct.DailyError != "" {
+		t.Errorf("daily_error 应为空, got=%q", acct.DailyError)
+	}
+	if len(acct.Daily) != 1 {
+		t.Fatalf("daily=%d want 1", len(acct.Daily))
+	}
+	d := acct.Daily[0]
+	if d.Code != "pkg_daily" || d.Total != 100 || d.Used != 42.5 || d.Remaining != 57.5 {
+		t.Errorf("daily 切片错: %+v", d)
 	}
 }

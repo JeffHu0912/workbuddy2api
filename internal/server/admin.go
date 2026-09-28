@@ -30,18 +30,29 @@ func (h *Handler) adminPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminCredits 查询全部账号的实时额度（并发拉取 CodeBuddy 上游）。
+// 除实时余额外，顺带拉「今日套餐切片」（借鉴 WBCenter）：当日发放/已用/剩余。
+// 切片失败只记 daily_error，不影响主额度展示。
 func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
+	type dailyPkg struct {
+		Code      string  `json:"code"`
+		Name      string  `json:"name"`
+		Total     float64 `json:"total"`
+		Used      float64 `json:"used"`
+		Remaining float64 `json:"remaining"`
+	}
 	type acct struct {
-		UID          string `json:"uid"`
-		Nickname     string `json:"nickname"`
-		Remain       int64  `json:"remain"`
-		Cooling      bool   `json:"cooling"`
-		Disabled     bool   `json:"disabled"`
-		InFlight     int    `json:"in_flight"`
-		SuccessCount int64  `json:"success_count"`
-		ErrTotal     int64  `json:"err_total"`
-		Reason       string `json:"reason,omitempty"`
-		Error        string `json:"error,omitempty"`
+		UID          string     `json:"uid"`
+		Nickname     string     `json:"nickname"`
+		Remain       int64      `json:"remain"`
+		Cooling      bool       `json:"cooling"`
+		Disabled     bool       `json:"disabled"`
+		InFlight     int        `json:"in_flight"`
+		SuccessCount int64      `json:"success_count"`
+		ErrTotal     int64      `json:"err_total"`
+		Reason       string     `json:"reason,omitempty"`
+		Error        string     `json:"error,omitempty"`
+		Daily        []dailyPkg `json:"daily,omitempty"`
+		DailyError   string     `json:"daily_error,omitempty"`
 	}
 
 	st := h.cfg.Pool.List()
@@ -73,6 +84,20 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 			} else {
 				ac.Remain = remain
 				h.cfg.Pool.SetCredits(s.UID, remain)
+			}
+
+			// 今日套餐切片（best-effort）：拿不到只记 daily_error，不打断主流程。
+			if codes, cerr := h.cfg.Upstream.PackageCodes(a); cerr == nil && len(codes) > 0 {
+				if packs, derr := h.cfg.Upstream.DailyFreePackages(a, codes); derr == nil {
+					for _, p := range packs {
+						ac.Daily = append(ac.Daily, dailyPkg{
+							Code: p.Code, Name: p.Name,
+							Total: p.Total, Used: p.Used, Remaining: p.Remaining,
+						})
+					}
+				} else {
+					ac.DailyError = derr.Error()
+				}
 			}
 			out[i] = ac
 		}(i, s)

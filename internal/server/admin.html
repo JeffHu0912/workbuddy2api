@@ -61,6 +61,16 @@
   .remain span { font-size:13px; color:var(--dim); font-weight:400; margin-left:4px; }
   .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; margin-bottom:12px; }
   .meta b { color:var(--fg); font-weight:600; }
+  /* daily free packages（今日套餐切片） */
+  .daily { margin:2px 0 10px; border:1px solid #232836; border-radius:8px; overflow:hidden; }
+  .daily .dhead { background:var(--card2); color:var(--dim); font-size:11px; padding:5px 10px; letter-spacing:.3px; }
+  .daily table { width:100%; border-collapse:collapse; font-size:11px; }
+  .daily th, .daily td { text-align:right; padding:5px 10px; }
+  .daily th:first-child, .daily td:first-child { text-align:left; }
+  .daily th { color:var(--dim); font-weight:500; }
+  .daily td b { font-variant-numeric:tabular-nums; }
+  .daily .d-remain { color:var(--ok); }
+  .daily .d-used { color:var(--warn); }
   .errline { margin-top:8px; color:var(--bad); font-size:11px; word-break:break-all; }
   .card-actions { display:flex; gap:8px; justify-content:flex-end; border-top:1px solid #232836; padding-top:10px; margin-top:6px; }
   /* table */
@@ -207,6 +217,32 @@
     }
   }
 
+  // 今日套餐切片（发放/已用/剩余）—— 配额口径，非交易流水。
+  function renderDaily(daily, dailyErr) {
+    if (dailyErr) {
+      return `<div class="errline">⚠️ 今日切片: ${dailyErr}</div>`;
+    }
+    if (!daily || !daily.length) return '';
+    const fmt = n => (n === undefined || n === null) ? '-' :
+      (Number.isInteger(n) ? n.toLocaleString() : n.toFixed(2));
+    let rows = '';
+    daily.forEach(p => {
+      rows += `<tr>
+        <td title="${p.code || ''}">${p.name || p.code || '套餐'}</td>
+        <td><b>${fmt(p.total)}</b></td>
+        <td class="d-used"><b>${fmt(p.used)}</b></td>
+        <td class="d-remain"><b>${fmt(p.remaining)}</b></td>
+      </tr>`;
+    });
+    return `<div class="daily">
+      <div class="dhead">今日发放 / 已用 / 剩余</div>
+      <table>
+        <thead><tr><th>套餐</th><th>发放</th><th>已用</th><th>剩余</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  }
+
   function renderCards(list) {
     const grid = document.getElementById('cardsGrid');
     if (!list.length) {
@@ -246,6 +282,7 @@
             <div>成功: <b>${a.success_count || 0}</b></div>
             <div>错误: <b>${a.err_total || 0}</b></div>
           </div>
+          ${renderDaily(a.daily, a.daily_error)}
           ${a.reason ? `<div class="errline">⚠️ 原因: ${a.reason}</div>` : ''}
           ${a.error ? `<div class="errline">⚠️ 探测报错: ${a.error}</div>` : ''}
           <div class="card-actions">

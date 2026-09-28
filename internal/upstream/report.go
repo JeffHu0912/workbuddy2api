@@ -24,6 +24,12 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.billingJSONBase(a, method, path, body, c.billingBase(a))
+}
+
+// billingJSONBase 同 billingJSON，但允许调用方覆盖 billing base（free-packages 的
+// workbuddy.cn 兼容改写用；其余调用方一律走 billingJSON 的默认 base）。
+func (c *Client) billingJSONBase(a *auth.Auth, method, path string, body any, base string) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -32,7 +38,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		}
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.billingBase(a)+path, rdr)
+	req, err := http.NewRequest(method, base+path, rdr)
 	if err != nil {
 		return nil, err
 	}
