@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 # 国内 Go 模块镜像：构建容器内 127.0.0.1 访问不到宿主机代理，GOPROXY 直连更稳更快
@@ -15,6 +14,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/serve
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
 
 FROM alpine:3.20
+# Alpine 包源走国内镜像：构建容器内 apk 不走宿主机代理，dl-cdn 直连被掐时换镜像可通
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
 RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \
