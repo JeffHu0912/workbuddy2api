@@ -13,7 +13,8 @@
 #   2. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
 #   3. 你在浏览器打开 URL 完成登录
 #   4. 回到这里按 y → poll 拿 token+uid+nickname → （仅 CN）签到 → 落盘 auths/workbuddy-<uid>.json
-#   5. 重启 workbuddy2api 容器加载新账号
+#   5. 落盘 auths/workbuddy-<uid>.json（auths 目录热加载自动入池，默认不重启容器；
+#      --restart 标志手动触发 docker restart）
 #
 # 号池选择（2026-09-16 分池后）：--pool=phone（默认）| --pool=qq | --pool=hk
 #   phone → 落盘 ./auths/、重启 workbuddy2api、探活 :7863（config.json）
@@ -29,12 +30,15 @@ PORT=7863
 CFG="config.json"
 
 # ─── 号池选参：--pool=phone|qq|hk（不与其他 --realm 传参冲突）──────────
+#      --restart：默认不重启容器（auths 目录热加载已自动入池）；加此标志手动触发 docker restart。
 POOL="phone"
+RESTART=0
 for arg in "$@"; do
     case "$arg" in
         --pool=phone) POOL="phone" ;;
         --pool=qq)    POOL="qq" ;;
         --pool=hk)    POOL="hk" ;;
+        --restart)    RESTART=1 ;;
     esac
 done
 if [[ "$POOL" == "qq" ]]; then
@@ -393,16 +397,20 @@ else:
 PYEOF
 fi
 echo ""
-if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
-    echo "重启 $CONTAINER 加载新账号..."
-    docker restart "$CONTAINER" >/dev/null
-    sleep 2
-    # API_KEY 从对应池配置文件读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
-    API_KEY=$(python3 -c "import json; print(json.load(open('$CFG')).get('api_key',''))" 2>/dev/null)
-    COUNT=$(curl -s http://127.0.0.1:$PORT/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
-    echo "服务已重启，当前账号数: $COUNT"
+if [[ "$RESTART" == "1" ]]; then
+    if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
+        echo "重启 $CONTAINER 加载新账号..."
+        docker restart "$CONTAINER" >/dev/null
+        sleep 2
+        # API_KEY 从对应池配置文件读取（该变量在脚本中未定义，fallback 仅为占位，不会通过鉴权）
+        API_KEY=$(python3 -c "import json; print(json.load(open('$CFG')).get('api_key',''))" 2>/dev/null)
+        COUNT=$(curl -s http://127.0.0.1:$PORT/status -H "Authorization: Bearer ${API_KEY:-test_key}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+        echo "服务已重启，当前账号数: $COUNT"
+    else
+        echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"
+    fi
 else
-    echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"
+    echo "已保存账号（auths 目录热加载会自动入池，无需重启）。如需重启加载请加 --restart"
 fi
 
 echo ""

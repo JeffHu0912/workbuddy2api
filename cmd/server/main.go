@@ -210,6 +210,10 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// OAuth 热加载闭环：poll 成功落盘到 auths/ 并立即入池。
+		AuthDir: cfg.AuthDir,
+		// 管理面环形日志缓冲（/admin/api/logs 读）。
+		Log: server.NewLogBuffer(),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

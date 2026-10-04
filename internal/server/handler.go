@@ -16,6 +16,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/oauth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
@@ -51,6 +52,13 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// AuthDir OAuth 登录成功后凭证落盘目录（cfg.AuthDir）。用于热加载闭环：
+	// poll 成功 → SaveAtomic 落盘 workbuddy-<uid>.json → Pool.Add 立即入池。
+	AuthDir string
+
+	// Log 管理面环形日志缓冲（nil = 不记录，/admin/api/logs 返回空）。
+	Log *LogBuffer
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -85,6 +93,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// oauth OAuth 授权状态机（internal/oauth.Manager）；Upstream 为 nil 时未构建。
+	oauth *oauth.Manager
+	// oauthRL OAuth start/poll 限速器（10 次/15min，按来源 IP）。
+	oauthRL *rateLimiter
 }
 
 // NewHandler 构建 handler。
@@ -102,6 +114,13 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.oauthRL = newRateLimiter(oauthRateLimitCount, oauthRateLimitWindow)
+	if cfg.Upstream != nil {
+		h.oauth = oauth.New(
+			func(r upstream.Region) (string, string, error) { return cfg.Upstream.StartLogin(r) },
+			func(r upstream.Region, s string) (*auth.Auth, error) { return cfg.Upstream.PollLogin(r, s) },
+		)
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -124,10 +143,18 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/cooldown", h.withAuth(h.adminResetCooldown))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
+	// OAuth 设备授权端点 + 运行日志（走 withAuth；同源 + 限速在中间件内）。
+	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(sameOriginGuard(h.oauthRateLimit(h.adminOAuthStart))))
+	h.mux.HandleFunc("POST /admin/api/oauth/{id}/poll", h.withAuth(sameOriginGuard(h.oauthRateLimit(h.adminOAuthPoll))))
+	h.mux.HandleFunc("GET /admin/api/logs", h.withAuth(h.adminLogs))
 	return h
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 管理面安全头挂在所有 /admin/* 响应上（含新 OAuth/logs 端点与旧面板端点）。
+	if isAdminPath(r.URL.Path) {
+		setAdminSecurityHeaders(w)
+	}
 	h.mux.ServeHTTP(w, r)
 }
 

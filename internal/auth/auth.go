@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,15 @@ import (
 
 	"workbuddy2api/internal/logfmt"
 )
+
+// uidPattern 校验 uid 形态（用于文件名拼接 workbuddy-<uid>.json）：
+// 只允许安全字符集，排除路径分隔符与 ..，从源头杜绝目录穿越写入 auths 之外。
+var uidPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{6,128}$`)
+
+// ValidUID 报告 uid 是否可安全用于凭证文件名。
+func ValidUID(uid string) bool {
+	return uidPattern.MatchString(uid)
+}
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {

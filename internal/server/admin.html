@@ -115,6 +115,8 @@
   <div class="tabs">
     <div class="tab active" onclick="switchTab('cards',this)">实时卡片看板</div>
     <div class="tab" onclick="switchTab('table',this)">详细运行态列表</div>
+    <div class="tab" onclick="switchTab('add',this)">添加账号</div>
+    <div class="tab" onclick="switchTab('logs',this)">运行日志</div>
   </div>
 
   <!-- 卡片看板 -->
@@ -142,6 +144,45 @@
         <tr><td colspan="7" style="text-align:center;color:var(--dim)">加载中...</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <!-- 添加账号（OAuth 设备授权） -->
+  <div id="pane-add" class="pane">
+    <div class="card" style="max-width:640px">
+      <div class="card-top">
+        <div>
+          <div class="nick">添加账号（OAuth 设备授权）</div>
+          <div class="uid">成功后立即落盘并入池，无需重启</div>
+        </div>
+      </div>
+      <div class="meta" style="margin-top:16px">
+        <label>区域：
+          <select id="oauthRegion" style="background:var(--card2);color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:5px 10px">
+            <option value="cn" selected>国内版 (cn)</option>
+            <option value="global">国际版 (global)</option>
+          </select>
+        </label>
+        <button class="btn primary" onclick="startOAuth()">发起登录</button>
+      </div>
+      <div id="oauthStatus" style="display:none;margin-top:10px;font-size:13px"></div>
+      <div id="oauthUrl" style="display:none;margin-top:14px">
+        <div class="meta">请在浏览器打开以下链接完成登录：</div>
+        <a id="oauthLink" href="#" target="_blank" rel="noopener" style="color:var(--accent);word-break:break-all"></a>
+        <div class="meta" style="margin-top:12px">登录完成后将自动轮询结果（每 5 秒）：</div>
+        <button class="btn sm" onclick="pollOAuth()">立即轮询</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 运行日志 -->
+  <div id="pane-logs" class="pane">
+    <div class="card">
+      <div class="card-top">
+        <div class="nick">运行日志（最近 200 行，已脱敏）</div>
+        <button class="btn sm" onclick="loadLogs()">刷新</button>
+      </div>
+      <pre id="logView" style="margin-top:14px;background:var(--card2);border:1px solid #232836;border-radius:8px;padding:12px;font-size:12px;line-height:1.6;color:var(--dim);white-space:pre-wrap;word-break:break-all;max-height:60vh;overflow:auto">加载中...</pre>
+    </div>
   </div>
 </div>
 
@@ -177,6 +218,7 @@
     document.querySelectorAll('.pane').forEach(x => x.classList.remove('active'));
     el.classList.add('active');
     document.getElementById('pane-' + t).classList.add('active');
+    if (t === 'logs') loadLogs();
   }
 
   async function loadStatusOverview() {
@@ -369,6 +411,84 @@
     }).catch(() => {
       prompt('请手动复制 UID:', txt);
     });
+  }
+
+  // ─── 添加账号（OAuth 设备授权） ─────────────────────────────
+  let oauthPollTimer = null;
+  let oauthId = null;
+
+  async function startOAuth() {
+    const region = document.getElementById('oauthRegion').value;
+    const st = document.getElementById('oauthStatus');
+    const urlBox = document.getElementById('oauthUrl');
+    urlBox.style.display = 'none';
+    st.style.display = 'block';
+    st.style.color = 'var(--warn)';
+    st.textContent = '正在申请授权...';
+    try {
+      const res = await fetch('/admin/api/oauth/start', {
+        method: 'POST',
+        headers: Object.assign({}, authHeaders(), { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ region: region })
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        st.style.color = 'var(--bad)';
+        st.textContent = '发起失败: ' + (d.error || d.message || res.statusText);
+        return;
+      }
+      oauthId = d.id;
+      document.getElementById('oauthLink').href = d.url;
+      document.getElementById('oauthLink').textContent = d.url;
+      urlBox.style.display = 'block';
+      st.style.color = 'var(--ok)';
+      st.textContent = '已生成授权链接，请在浏览器完成登录';
+      if (oauthPollTimer) clearInterval(oauthPollTimer);
+      oauthPollTimer = setInterval(pollOAuth, 5000);
+    } catch (e) {
+      st.style.color = 'var(--bad)';
+      st.textContent = '网络异常: ' + e.message;
+    }
+  }
+
+  async function pollOAuth() {
+    if (!oauthId) return;
+    const st = document.getElementById('oauthStatus');
+    try {
+      const res = await fetch('/admin/api/oauth/' + oauthId + '/poll', {
+        method: 'POST',
+        headers: authHeaders()
+      });
+      const d = await res.json().catch(() => ({}));
+      if (d.status === 'success') {
+        if (oauthPollTimer) { clearInterval(oauthPollTimer); oauthPollTimer = null; }
+        st.style.color = 'var(--ok)';
+        st.textContent = '登录成功：uid=' + (d.uid || '') + (d.nickname ? ' ' + d.nickname : '') + '（已立即入池）';
+        loadCredits(false);
+      } else if (d.status === 'error') {
+        if (oauthPollTimer) { clearInterval(oauthPollTimer); oauthPollTimer = null; }
+        st.style.color = 'var(--bad)';
+        st.textContent = (d.message || '登录失败');
+      } else {
+        st.style.color = 'var(--warn)';
+        st.textContent = '等待登录完成...';
+      }
+    } catch (e) {
+      st.style.color = 'var(--bad)';
+      st.textContent = '网络异常: ' + e.message;
+    }
+  }
+
+  // ─── 运行日志 ──────────────────────────────────────────────
+  async function loadLogs() {
+    const view = document.getElementById('logView');
+    try {
+      const res = await fetch('/admin/api/logs?limit=200', { headers: authHeaders() });
+      const d = await res.json().catch(() => ({}));
+      view.textContent = (d.lines && d.lines.length) ? d.lines.join('\n') : '（暂无日志）';
+    } catch (e) {
+      view.textContent = '加载失败: ' + e.message;
+    }
   }
 
   // 初始化

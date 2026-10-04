@@ -19,7 +19,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +30,7 @@ import (
 	"time"
 
 	auth2 "workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -205,33 +205,42 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 	return nil
 }
 
-// runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
+// oauthUpstream 由 base/realm/client 构造委托给 internal/upstream 的 Client。
+// OAuth 设备流的端点路径、请求头（Origin/Referer 按 realm 推导）、信封解析与
+// 11217 归一都收敛在 internal/upstream/oauth.go，CLI 与服务器共用同一实现。
+func oauthUpstream(base, realm string, client *http.Client) *upstream.Client {
+	c := &upstream.Client{HTTP: client}
+	if realm == realmGlobal {
+		c.ChatBaseGlobal = base
+	} else {
+		c.ChatBaseCN = base
+	}
+	return c
+}
+
+// runURL 执行 url 子命令：委托 upstream.StartLogin 申请 state + authUrl，
 // state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
+// origin 参数保留（兼容调用方/测试签名）；实际 Origin 由 upstream 按 realm 推导。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
-	headers := commonHeaders(origin)
-	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+	_ = origin
+	c := oauthUpstream(base, realm, client)
+	state, url, err := c.StartLogin(upstream.Region(realm))
 	if err != nil {
 		fatal("auth state failed: %v", err)
 	}
-	var st struct {
-		State   string `json:"state"`
-		AuthURL string `json:"authUrl"`
-	}
-	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
-		fatal("auth state: missing state or authUrl")
-	}
-	raw, _ := json.Marshal(loginState{State: st.State, Realm: realm})
+	raw, _ := json.Marshal(loginState{State: state, Realm: realm})
 	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
 		fatal("write state: %v", err)
 	}
-	fmt.Fprintln(out, st.AuthURL)
+	fmt.Fprintln(out, url)
 }
 
-// runPoll 执行 poll 子命令：读 state 文件（realm 校验），向 upstreamBase 的 token 端点
-// GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
+// runPoll 执行 poll 子命令：读 state 文件（realm 校验），委托 upstream.PollLogin 轮询
+// 登录结果（waiting/成功/失败），成功 stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
 func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
+	_ = origin
 	raw, err := os.ReadFile(statePath)
 	if err != nil {
 		fatal("read state: %v (先跑 login url)", err)
@@ -244,38 +253,32 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	if err := validateRealmMatch(ls.Realm, realm); err != nil {
 		fatal("%v", err)
 	}
-	headers := commonHeaders(origin)
-	// handlePollLogin：auth/token 是权威登录状态端点，
-	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
-	if errTok != nil {
-		if status == 0 || status >= 500 {
-			fatal("token endpoint error: %v", errTok)
-		}
+	c := oauthUpstream(base, realm, client)
+	a, err := c.PollLogin(upstream.Region(realm), ls.State)
+	if err != nil {
+		fatal("token endpoint error: %v", err)
+	}
+	if a == nil {
 		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 	}
-	var tok struct {
+	// expires_in 由 ExpiresAt 反推（PollLogin 已把上游 expiresIn 折成 Unix 秒）。
+	expiresIn := int64(0)
+	if a.ExpiresAt > 0 {
+		if s := a.ExpiresAt - time.Now().Unix(); s > 0 {
+			expiresIn = s
+		}
+	}
+	tok := struct {
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		ExpiresIn    int64  `json:"expiresIn"`
 		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-	}
-	// login/account 拿 uid/nickname（带 Bearer）
-	var acct struct {
+	}{AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresIn: expiresIn, Domain: a.Domain}
+	acct := struct {
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
-	}
-	acctHeaders := func(r *http.Request) {
-		headers(r)
-		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	}
-	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+ls.State, acctHeaders, nil); errAcct == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
-	}
+	}{UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname}
 	oraw, _ := json.Marshal(buildLoginOutput(tok, realm, acct))
 	fmt.Fprintln(out, string(oraw))
 	os.Remove(statePath)
