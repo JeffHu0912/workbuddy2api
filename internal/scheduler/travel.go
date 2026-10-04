@@ -4,6 +4,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -93,30 +94,36 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
-func (s *Scheduler) travelOne(a *auth.Auth) {
+// 返回 (status, detail)：status=ok 表示状态机推进成功（领养/派出/领奖/在途跳过），
+// fail 表示查询/写动作失败（detail 含上游错误原文，供 oneclick 判定 session dead）。
+func (s *Scheduler) travelOne(a *auth.Auth) (status, detail string) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return "fail", "buddy-info: " + err.Error()
 	}
 	if buddy == nil {
 		s.travelAdopt(a)
-		return
+		return "ok", "adopt attempted"
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
 		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return "fail", "status: " + err.Error()
 	}
 	switch ts.State {
 	case travelStateArrived:
 		s.travelClaim(a, ts)
+		return "ok", "claim"
 	case travelStateIdle:
 		s.travelDepart(a, ts)
+		return "ok", "depart"
 	case travelStateTraveling:
 		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
+		return "ok", fmt.Sprintf("skip (traveling record=%d)", ts.RecordID)
 	default:
 		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
+		return "ok", fmt.Sprintf("skip (unknown state %q)", ts.State)
 	}
 }
 
