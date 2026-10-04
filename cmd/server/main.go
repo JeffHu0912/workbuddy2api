@@ -214,6 +214,8 @@ func main() {
 		AuthDir: cfg.AuthDir,
 		// 管理面环形日志缓冲（/admin/api/logs 读）。
 		Log: server.NewLogBuffer(),
+		// 一键任务端点复用调度器做单账号签到/活跃/旅行（growth 走 shell-out）。
+		Scheduler: sch,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

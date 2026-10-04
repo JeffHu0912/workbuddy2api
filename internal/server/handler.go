@@ -19,6 +19,7 @@ import (
 	"workbuddy2api/internal/oauth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
@@ -59,6 +60,11 @@ type Config struct {
 
 	// Log 管理面环形日志缓冲（nil = 不记录，/admin/api/logs 返回空）。
 	Log *LogBuffer
+
+	// Scheduler 定时调度器（nil = 一键任务端点仍可用，但 checkin/activity/travel
+	// 动作会按账号失败下沉为 "scheduler not configured"；growth 走 shell-out 不受影响）。
+	// 注入后 /admin/api/oneclick 复用它做单账号签到 / 活跃 / 旅行。
+	Scheduler *scheduler.Scheduler
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -143,6 +149,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/cooldown", h.withAuth(h.adminResetCooldown))
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAuth(h.adminCheckin))
+	h.mux.HandleFunc("POST /admin/api/oneclick", h.withAuth(h.adminOneclick))
 	// OAuth 设备授权端点 + 运行日志（走 withAuth；同源 + 限速在中间件内）。
 	h.mux.HandleFunc("POST /admin/api/oauth/start", h.withAuth(sameOriginGuard(h.oauthRateLimit(h.adminOAuthStart))))
 	h.mux.HandleFunc("POST /admin/api/oauth/{id}/poll", h.withAuth(sameOriginGuard(h.oauthRateLimit(h.adminOAuthPoll))))

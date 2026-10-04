@@ -5,7 +5,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -311,88 +310,14 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
 	for _, st := range statuses {
-		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
-		if st.Disabled {
-			oc.Status, oc.Detail = CheckinSkipped, "disabled"
-			skipN++
-			out = append(out, oc)
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
-			skipN++
-			out = append(out, oc)
-			continue
-		}
-		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			oc.Status, oc.Detail = CheckinSkipped, "global"
-			skipN++
-			out = append(out, oc)
-			continue
-		}
-		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
-		if a.NeedsRefresh(checkinRefreshSkew) {
-			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
-				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					if s.cfg.Pool.NoteSessionDead(st.UID) {
-						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
-					}
-				}
-				// 刷新只是"提前补票"：token 若仍有效，继续照常签到（否则刷新接口抖动
-				// 会让本可成功的签到被白白跳过）；真正过期才判定失败。
-				if a.NeedsRefresh(0) {
-					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
-					failN++
-					out = append(out, oc)
-					continue
-				}
-			} else {
-				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
-				if err := a.SaveAtomic(); err != nil {
-					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-					log.Printf("checkin %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
-				}
-			}
-		}
-		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			if upstream.IsAlreadyCheckin(err) {
-				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
-				// 出现一整段 400 报文、被误读成签到失败。
-				oc.Status = CheckinAlready
-			} else {
-				oc.Status = CheckinFail
-				oc.Detail = err.Error()
-				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			}
-		} else {
-			oc.Status = CheckinOK
-		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			oc.Status = CheckinFail
-			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
-			failN++
-			out = append(out, oc)
-			continue
-		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
-		oc.Credits = &remain
+		oc := s.checkinOne(st)
 		switch oc.Status {
 		case CheckinOK:
 			okN++
 		case CheckinAlready:
 			alreadyN++
+		case CheckinSkipped:
+			skipN++
 		default:
 			failN++
 		}
@@ -434,9 +359,9 @@ func (s *Scheduler) RunActivityNow() {
 	s.runActivity(context.Background())
 }
 
-// runActivity 活跃上报遍历，随 ctx 取消立即退出。
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。单账号逻辑在 activityOne
+// （oneclick_result.go，含结构化结果返回），此处只做池遍历 + 账号间限速。
 func (s *Scheduler) runActivity(ctx context.Context) {
-	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -448,37 +373,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
-		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
+		// 单账号失败只记 WARN 不影响遍历（activityOne 内 report err → break 该号）。
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
 		}
 		first = false
-		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		ok := 0
-		for i := 1; i <= count; i++ {
-			rid := fmt.Sprintf("%s-r%d", cid, i)
-			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
-				log.Printf("activity %s: report %d/%d: %v", logfmt.Label(a.UID, a.Nickname), i, count, err)
-				break // 本号上报失败：不再续发，streak 自检无意义
-			}
-			log.Printf("activity %s: report %d/%d ok", logfmt.Label(a.UID, a.Nickname), i, count)
-			ok++
-			if i < count {
-				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
-				if !sleepCtx(ctx, activityReportGap) {
-					return
-				}
-			}
-		}
-		if ok < count {
-			continue // N 条未发满：streak 自检与领养均无意义，下个账号
-		}
-		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
-		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
-		s.claimGrowthRewards(a)  // 连登奖励 + 抽奖：点亮连登后按天领取（finally 语义：失败不拖累上报）
+		s.activityOne(ctx, a)
 	}
 }
 
