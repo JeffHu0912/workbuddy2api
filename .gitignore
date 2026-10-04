@@ -54,6 +54,9 @@ docker-compose-merged.yml
 /activity_bin
 /credit_bin
 
+# 批量跑批日志（每号运行日志 + summary，含 uid 前 8 位，不入库）
+logs/
+
 # IDE
 .idea/
 .vscode/
