@@ -50,6 +50,11 @@
                         无 activityId——服务端按 source=mini_program 指纹关联） 100c+5e
     school_season      参与「校园日」有奖活动（jump 落 coffee-activity H5 = school 开学季
                         同一活动；mini chat_request_send + activityId 点亮）    100c+5e
+     Sequential_Tasks_2  在小程序内完成 1 次专家对话（mini expert_actual_use，
+                         无 activityId；链式解锁：Sequential_Tasks_1 需已 claimed）200c+5e
+   人工环节任务（脚本只 accept/claim，中间态由人工完成，不伪造已关注）：
+     wb_wechat_oa_subscribe_task  关注「腾讯 WorkBuddy」公众号（not_accepted→accepted→
+                         真实关注满 24h→claim；指引 /events/follow-guide/）     100c+5e
   仍不可伪造：
     Expert_Philanthropy   真实捐款动作(M8)
 
@@ -118,10 +123,23 @@ MAPPING = {
     "expert_use":             {"kind": "school", "target": 1, "src": "BackToSchool 专家 id"},
     "share_invite":           {"kind": "school", "target": 1, "src": "无(share-complete)"},
     "desktop_chat_1_time":    {"kind": "school", "target": 1, "src": "无(桌面 6 连+activityId)"},
-    # 小程序成长任务（growth 域小程序限定）：列表/accept/claim 均需 X-Client-Platform: miniprogram
-    "Sequential_Tasks_1":     {"kind": "minichat", "target": 1, "src": "无(mini 对话无activityId)"},
+    # 小程序成长任务（growth 域小程序限定，platform=miniprogram）：列表/accept/claim
+    # 均需 X-Client-Platform: miniprogram（缺头不下发 / accept 返回 task not found）
+    "Sequential_Tasks_1":     {"kind": "minichat", "target": 1, "platform": "miniprogram",
+                               "src": "无(mini 对话无activityId)"},
     # 同下发口径的「校园日」任务：判据是 school 域 activityId 关联（mini chat + activityId）
-    "school_season":          {"kind": "schoolseason", "target": 1, "src": "无(mini chat+activityId)"},
+    "school_season":          {"kind": "schoolseason", "target": 1, "platform": "miniprogram",
+                               "src": "无(mini chat+activityId)"},
+    # P2 小程序限定：完成 1 次专家对话（mini expert_actual_use 无 activityId）；
+    # 链式解锁：Sequential_Tasks_1 需已 claimed 才下发/可处理（prereq 前置检查）
+    "Sequential_Tasks_2":     {"kind": "miniexpert", "target": 1, "platform": "miniprogram",
+                               "prereq": "Sequential_Tasks_1",
+                               "src": "专家市场 ex_ id(mini 专家对话)", "new": True},
+    # 关注「腾讯 WorkBuddy」公众号：web/小程序双口径下发（web 优先）；
+    # 人工环节（真实关注满 24h 才能 claim）——脚本只做 accept 与 claim，不伪造已关注
+    "wb_wechat_oa_subscribe_task": {"kind": "oa_subscribe", "target": 1, "platform": "web",
+                                    "jump": "https://www.workbuddy.cn/events/follow-guide/",
+                                    "src": "人工关注公众号满24h", "new": True},
     # 不可伪造（真实业务副作用）
     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
 }
@@ -443,6 +461,8 @@ SCHOOL_REPORT_KIND = {
 # growth 域小程序限定任务：列表/accept/claim 端点对 X-Client-Platform 敏感（缺头时任务
 # 不下发、accept 返回 task not found）。web 小程序 H5 在请求拦截器统一注入该头
 # （config-D_y8qqW1.js: E() 判 session platform=miniProgram，te()=$:miniprogram）。
+# MAPPING 条目以 platform 字段标注下发口径：miniprogram → 注入本表（列表/accept/claim）；
+# web（缺省）→ 不注入（task_common 默认头即 web 口径，claim 400 时另有 web 域降级）。
 MP_PLATFORM_HEADER = {"X-Client-Platform": "miniprogram"}
 
 
@@ -477,6 +497,9 @@ def ids_for(kind, auth, need, offset=0):
     if kind == "school":
         # school 任务的进度语义同上（每次事件独立 +1，无对象 id）；school 域进度不在 growth 任务里
         return [("", {}) for _ in range(need)]
+    if kind == "miniexpert":
+        # 小程序专家对话（Sequential_Tasks_2）：专家市场 ex_ id 作为对话对象
+        return _dedup_slice(_fetch_market_experts(auth), offset, need)
     return []
 
 
@@ -748,6 +771,24 @@ def build_event(auth, kind, obj_id, meta, idx):
         # 构造器保证字段与 school 段单一事实源（勿在此手抄第二份形状）。
         return school.mini_chat_event(auth, f"wb-run-{now}-{idx}")
 
+    if kind == "miniexpert":
+        # 小程序专家对话（Sequential_Tasks_2）判据：mini 指纹 expert_actual_use，
+        # 无 activityId（growth 域按 source=mini_program 指纹关联，与 P1 minichat 同口径）。
+        # 形状对齐 school.expert_actual_use_event 去 activityId，extVersion 与 minichat 一致。
+        return {"eventCode": "expert_actual_use", "timestamp": now, "reportDelay": 0,
+                "source": "mini_program", "ideName": "wx_app_cloud",
+                "ideType": "WorkBuddy_MP", "extName": "workbuddy-mp",
+                "extVersion": "2.4.0",
+                "machineId": derive_id(auth, "machine"), "os": "android",
+                "osVersion": "14", "arch": "arm64", "timezone": "Asia/Shanghai",
+                "userId": uid, "userNickname": auth.get("nick", ""),
+                "id": obj_id or DEFAULT_EXPERT_IDS[0],
+                "name": obj_id or DEFAULT_EXPERT_IDS[0],
+                "expertTitle": m.get("name") or "",
+                "type": "send_message", "characterCount": 12,
+                "expertType": m.get("expertType") or "agent",
+                "conversationId": cid, "requestId": cid, "messageId": cid}
+
     raise ValueError(f"unknown kind: {kind}")
 
 
@@ -788,13 +829,15 @@ def _claim_via_web(auth, code, uid8, stats, gap):
     return _claim_parse(auth, code, uid8, stats, gap, st, r, via_web=True)
 
 
-def claim_one(auth, code, uid8, stats, gap, mp=False):
+def claim_one(auth, code, uid8, stats, gap, mp=None):
     """领单个任务。返回 1=新入账 2=already_claimed 0=失败。
 
     chat 域（M15 实测成功）先行；400 则自动降级 web 域带完整头（web_claim_fallback）。
     幂等语义保持：already_claimed 不算失败（返回 2）。
-    mp=True 时带 X-Client-Platform: miniprogram（小程序限定任务 claim 必需）。
+    mp 缺省按 MAPPING[code].platform 自动推导：miniprogram 任务 claim 必需该头。
     """
+    if mp is None:
+        mp = (MAPPING.get(code) or {}).get("platform") == "miniprogram"
     st, r = tc.do_post(auth, tc.chat_base(auth),
                        f"/activity/growth/tasks/{code}/claim", None,
                        headers=MP_PLATFORM_HEADER if mp else None)
@@ -976,15 +1019,16 @@ def _mp_task_status(auth, code):
     return next((t for t in _mp_list_tasks(auth) if t.get("task_code") == code), None)
 
 
-def process_minichat_task(auth, code, opts, stats, uid8):
-    """小程序成长任务：mp 口径查询 → accept → mini 对话上报 → 回读 → claim。
+def process_mp_task(auth, code, opts, stats, uid8):
+    """小程序口径成长任务（MAPPING platform=miniprogram）：mp 查询 → accept → 判据上报 → 回读 → claim。
 
-    与 process_task 的 growth 主循环分开处理：该任务在默认（无 mp 头）列表里不存在，
+    与 process_task 的 growth 主循环分开处理：mp 限定任务在默认（无 mp 头）列表里不存在，
     accept/claim 也要求同一头（缺头 accept 返回 task not found，实测）。
-    适用于同一 mp 下发口径的 Sequential_Tasks_1（判据 kind=minichat，无 activityId）
-    与 school_season（判据 kind=schoolseason，mini chat + activityId）——两者仅
-    上报事件形状不同，链路（accept/claim/回读）完全一致。
-    spec 由 MAPPING 提供，未映射的 mp 任务保守跳过。
+    适用于同下发口径的 Sequential_Tasks_1（kind=minichat，无 activityId）、
+    Sequential_Tasks_2（kind=miniexpert，mini expert_actual_use，链式前置 P1 claimed）
+    与 school_season（kind=schoolseason，mini chat + activityId）——仅上报事件形状不同，
+    链路（accept/claim/回读）完全一致。
+    spec 由 MAPPING 提供；prereq（链式解锁）未 claimed 时跳过，未映射的 mp 任务保守跳过。
     """
     spec = MAPPING.get(code) or {}
     kind = spec.get("kind") or "minichat"
@@ -1002,23 +1046,41 @@ def process_minichat_task(auth, code, opts, stats, uid8):
     ast = t.get("accept_status")
     prog = t.get("progress") or {}
     cur = prog.get("current") or 0
-    target = prog.get("target") or 1
+    target = prog.get("target") or spec.get("target") or 1
     stats["total"] += 1
 
+    # 链式解锁前置：accept 前查 prereq（只读），未 claimed 则跳过（P1 未解锁，跳过）
+    prereq = spec.get("prereq")
+    if prereq:
+        try:
+            p1 = _mp_task_status(auth, prereq)
+        except Exception as e:
+            print(f"[task_runner] {uid8} {code}: prereq({prereq}) 查询失败: {e}")
+            stats["fail"] += 1
+            return
+        if (p1 or {}).get("accept_status") != "claimed":
+            print(f"[task_runner] {uid8} {code}: P1({prereq}) 未解锁"
+                  f"（accept_status={(p1 or {}).get('accept_status')}），跳过")
+            stats["skip"] += 1
+            return
+
+    newtag = "[新] " if spec.get("new") else ""
     if ast == "claimed":
         print(f"[task_runner] {uid8} {code}: query claimed({cur}/{target}) -> 已领，跳过")
         stats["already"] += 1
         return
     if ast == "completed" or cur >= target:
         if not opts.yes:
-            print(f"[task_runner] {uid8} {code}: query completed({cur}/{target}) -> 可领(claim)，dry-run 跳过")
+            print(f"[task_runner] {uid8} {code}: query completed({cur}/{target}) -> "
+                  f"{newtag}小程序限定 可领(claim)，dry-run 跳过")
             stats["pending"] += 1
             return
-        claim_one(auth, code, uid8, stats, opts.gap, mp=True)
+        claim_one(auth, code, uid8, stats, opts.gap)
         return
 
     if not opts.yes:
-        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮({kind})，dry-run 跳过")
+        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> "
+              f"{newtag}小程序限定 可点亮({kind})，dry-run 跳过")
         stats["pending"] += 1
         return
 
@@ -1034,11 +1096,13 @@ def process_minichat_task(auth, code, opts, stats, uid8):
             stats["fail"] += 1
             return
 
-    # 2) 判据上报：mini 指纹 chat_request_send（minichat 无 activityId /
-    #    schoolseason 带 activityId），走 codebuddy.cn 域（school.report_events）
+    # 2) 判据上报：mini 指纹事件（minichat 无 activityId / schoolseason 带 activityId /
+    #    miniexpert 带专家 id），走 codebuddy.cn 域（school.report_events）
     need = max(1, target - cur)
+    ids = ids_for(kind, auth, need, offset=0) if kind == "miniexpert" else [("", {})] * need
     for i in range(need):
-        ev = build_event(auth, kind, "", {}, i)
+        obj_id, meta = ids[i] if i < len(ids) else ("", {})
+        ev = build_event(auth, kind, obj_id, meta, i)
         st, r = school.report_events(auth, [ev])
         sc = r.get("code") if isinstance(r, dict) else r
         print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st} code={sc} (mini growth)")
@@ -1057,10 +1121,131 @@ def process_minichat_task(auth, code, opts, stats, uid8):
         stats["already"] += 1
         return
     if ast2 == "completed" or cur2 >= prog2.get("target", target):
-        claim_one(auth, code, uid8, stats, opts.gap, mp=True)
+        claim_one(auth, code, uid8, stats, opts.gap)
         return
     print(f"[task_runner] {uid8} {code}: report 未达 target（{cur2}/{prog2.get('target', target)}），WARN 待下次")
     stats["pending"] += 1
+
+
+# --------------------------------------------------------------------------
+# 关注公众号任务（wb_wechat_oa_subscribe_task，人工环节专用状态机）
+# --------------------------------------------------------------------------
+def _oa_claim_soft(auth, code, uid8, stats, gap):
+    """OA 关注公众号任务专用 claim（软失败语义）。
+
+    与 claim_one 同款降级（chat 域 400 → web 域），但失败不计数为 fail：
+    上游返回「未完成」类错误说明人工关注动作未达标（未关注/不满 24h），
+    标注需先关注公众号满 24h 后跳过，等人工完成后再跑。成功/已领走统一计数（幂等）。
+    """
+    st, r = tc.do_post(auth, tc.chat_base(auth),
+                       f"{tc.PATH_CLAIM_REWARD}/{code}/claim", None)
+    if st == 400:
+        print(f"[task_runner] {uid8} {code}: claim 400 -> 降级 web 域")
+        st, r = tc.do_post(auth, WEB_BASE, f"/activity/growth/tasks/{code}/claim",
+                           None, headers=_web_claim_headers(auth))
+    if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
+        msg = r.get("msg") if isinstance(r, dict) else r
+        print(f"[task_runner] {uid8} {code}: claim {st} {msg} -> 未完成类错误，需先关注公众号满 24h，跳过")
+        stats["skip"] += 1
+        time.sleep(gap)
+        return 0
+    data = r.get("data") or {}
+    credit = data.get("credit") or 0
+    energy = data.get("energy") or 0
+    if data.get("already_claimed"):
+        print(f"[task_runner] {uid8} {code}: claim 200 already_claimed(credit=+{credit} energy=+{energy})")
+        stats["already"] += 1
+        time.sleep(gap)
+        return 2
+    print(f"[task_runner] {uid8} {code}: claim 200 ok(credit=+{credit} energy=+{energy})")
+    stats["ok"] += 1
+    stats["credit"] += credit
+    stats["energy"] += energy
+    time.sleep(gap)
+    return 1
+
+
+def process_oa_subscribe_task(auth, code, t, opts, stats, uid8):
+    """关注「腾讯 WorkBuddy」公众号任务（wb_wechat_oa_subscribe_task）。
+
+    状态机：not_accepted → accepted →（人工真实关注公众号，满 24h 服务端核验）→ completed。
+    脚本能力边界（不伪造「已关注」状态，只做两个端点的调用）：
+      - 阶段1（自动）：--yes 正常模式 accept（web 口径优先；web/小程序双口径均下发）。
+      - 阶段2（claim only）：--only-claim 时 accepted 也尝试 claim（幂等安全），
+        上游返回未完成类错误 → 标注需先关注公众号满 24h，跳过且不算 fail。
+      - 中间态（accepted）不做任何事件上报，等待人工关注满 24h 后由服务端翻转状态。
+    """
+    spec = MAPPING.get(code) or {}
+    ast = t.get("accept_status")
+    prog = t.get("progress") or {}
+    cur = prog.get("current") or 0
+    target = prog.get("target") or spec.get("target") or 1
+    jump = spec.get("jump") or ""
+    newtag = "[新] " if spec.get("new") else ""
+
+    if ast == "claimed":
+        print(f"[task_runner] {uid8} {code}: query claimed({cur}/{target}) -> 已领，跳过")
+        stats["already"] += 1
+        return
+
+    # --only-claim（阶段2）：accepted 也尝试 claim（人工可能已完成关注）；
+    # 未完成类错误 → 需先关注公众号满 24h，跳过不算 fail。
+    if opts.only_claim:
+        if ast == "completed" or cur >= target:
+            if not opts.yes:
+                print(f"[task_runner] {uid8} {code}: query completed({cur}/{target}) -> only_claim dry-run 跳过")
+                stats["pending"] += 1
+                return
+            claim_one(auth, code, uid8, stats, opts.gap)
+            return
+        if ast == "accepted":
+            if not opts.yes:
+                print(f"[task_runner] {uid8} {code}: query accepted({cur}/{target}) -> "
+                      f"only_claim dry-run（将尝试 claim；需人工关注公众号满 24h）")
+                stats["pending"] += 1
+                return
+            _oa_claim_soft(auth, code, uid8, stats, opts.gap)
+            return
+        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 未接任务，only_claim 跳过")
+        stats["skip"] += 1
+        return
+
+    # 正常模式：completed 领奖；accepted 等待人工；not_accepted 先 accept（阶段1）
+    if ast == "completed" or cur >= target:
+        if not opts.yes:
+            print(f"[task_runner] {uid8} {code}: query completed({cur}/{target}) -> {newtag}已完成 可领(claim)，dry-run 跳过")
+            stats["pending"] += 1
+            return
+        claim_one(auth, code, uid8, stats, opts.gap)
+        return
+
+    if not opts.yes:
+        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> "
+              f"{newtag}需人工关注公众号满 24h（脚本仅 accept/claim，指引 {jump}），dry-run 跳过")
+        stats["pending"] += 1
+        return
+
+    if ast == "accepted":
+        print(f"[task_runner] {uid8} {code}: accepted，需关注公众号满 24h（人工环节，指引 {jump}），跳过")
+        stats["pending"] += 1
+        return
+
+    # not_accepted → accept（web 口径；web/小程序双口径均下发，web 优先）
+    st, r = tc.accept_tasks(auth, [code])
+    status = ""
+    if isinstance(r, dict):
+        results = ((r.get("data") or {}).get("results") or [])
+        status = (results[0].get("status") or "") if results else (r.get("msg") or "")
+    else:
+        status = str(r)
+    print(f"[task_runner] {uid8} {code}: accept {st} status={status}")
+    time.sleep(opts.gap)
+    if st == 200 and status == "accepted":
+        print(f"[task_runner] {uid8} {code}: accepted，需关注公众号满 24h（人工环节，指引 {jump}）")
+        stats["pending"] += 1
+    else:
+        print(f"[task_runner] {uid8} {code}: accept 未生效（{st}/{status}），本轮跳过")
+        stats["fail"] += 1
 
 
 # --------------------------------------------------------------------------
@@ -1084,6 +1269,11 @@ def process_task(auth, code, t, opts, stats):
     if spec.get("unforgeable"):
         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 不可伪造({spec['reason']})，skip")
         stats["skip"] += 1
+        return
+
+    # 关注公众号任务（人工环节专用状态机）：脚本只做 accept/claim，不伪造已关注
+    if spec.get("kind") == "oa_subscribe":
+        process_oa_subscribe_task(auth, code, t, opts, stats, uid8)
         return
 
     # 只领奖 模式：对已满足/已领任务执行 claim（已领->already_claimed 幂等），
@@ -1319,18 +1509,19 @@ def process_account(auth, opts, stats):
     by_code = {t.get("task_code"): t for t in tasks}
     # growth 映射里带 school 段的 codes：growth 任务列表无此 code（school 域独立任务空间），
     # 由 process_school_tasks 专段处理，不进 process_task（growth claim 端点对 school 任务 400）。
-    # minichat 同理：mp 限定任务在默认口径列表不出现，由 process_minichat_task 专段处理。
+    # mp 限定任务同理：platform=miniprogram 的任务在默认口径列表不出现，
+    # 由 process_mp_task 专段处理（列表/accept/claim 均注入 mp 头）。
     school_in_map = [c for c in MAPPING if MAPPING[c].get("kind") == "school"]
-    minichat_in_map = [c for c in MAPPING if MAPPING[c].get("kind") in ("minichat", "schoolseason")]
-    special = set(school_in_map) | set(minichat_in_map)
+    mp_in_map = [c for c in MAPPING if MAPPING[c].get("platform") == "miniprogram"]
+    special = set(school_in_map) | set(mp_in_map)
     if opts.only_codes:
         codes = [c for c in opts.only_codes if c not in special]
         process_school = bool(set(opts.only_codes) & set(school_in_map))
-        process_minichat = bool(set(opts.only_codes) & set(minichat_in_map))
+        process_mp = bool(set(opts.only_codes) & set(mp_in_map))
     else:
-        codes = [c for c in MAPPING if MAPPING[c].get("kind") not in ("school", "minichat", "schoolseason")]
+        codes = [c for c in MAPPING if c not in special]
         process_school = True
-        process_minichat = True
+        process_mp = True
         # 未在映射表但存在于任务列表的（如 Expert_Philanthropy）——只计数展示
         for t in tasks:
             c = t.get("task_code")
@@ -1354,15 +1545,15 @@ def process_account(auth, opts, stats):
             continue
         process_task(auth, code, t, opts, stats)
 
-    # 小程序成长任务段（mp 口径）：已完成/可领状态下 only_claim 模式仍可入账（claim 幂等）；
+    # 小程序限定任务段（mp 口径）：已完成/可领状态下 only_claim 模式仍可入账（claim 幂等）；
     # 未完成则点亮判据属写操作，与 school 段同规则只在非 only_claim 模式触发。
-    if process_minichat:
+    if process_mp:
         if opts.only_claim and not opts.yes:
             pass  # only_claim+dry-run：无写操作，专段内部自行按 dry-run 跳过
         else:
             # --only 语义：指定了 mp code 时只跑指定的（与 growth/school 段一致）
-            mp_codes = ([c for c in opts.only_codes if c in minichat_in_map]
-                        if opts.only_codes else minichat_in_map)
+            mp_codes = ([c for c in opts.only_codes if c in mp_in_map]
+                        if opts.only_codes else mp_in_map)
             for mp_code in mp_codes:
                 try:
                     t = _mp_task_status(auth, mp_code)
@@ -1371,7 +1562,7 @@ def process_account(auth, opts, stats):
                         # only_claim 只入账已完成任务；未完成不点亮
                         print(f"[task_runner] {uid8} {mp_code}: only_claim 跳过（未 completed）")
                     else:
-                        process_minichat_task(auth, mp_code, opts, stats, uid8)
+                        process_mp_task(auth, mp_code, opts, stats, uid8)
                 except Exception as e:
                     print(f"[task_runner] {uid8} {mp_code}: mp 查询失败: {e}")
                     stats["fail"] += 1
