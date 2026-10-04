@@ -40,6 +40,19 @@ draft_*_folder/
 
 # Backups (contains auth tokens)
 backups/
+auths-backup-*/
+auths-graveyard/
+auths-quarantine/
+
+# 第二实例（含独立 config.json + auths/，全部敏感）
+instance-global/
+
+# 本地合并 compose 草稿（含 api_key 占位，不入库）
+docker-compose-merged.yml
+
+# 本地编译工具产物（activity/credit 调试二进制，根目录锚定避免误伤 cmd/）
+/activity_bin
+/credit_bin
 
 # IDE
 .idea/
