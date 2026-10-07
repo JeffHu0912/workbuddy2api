@@ -66,6 +66,7 @@ func (s *chatStat) done() {
 	total := time.Since(s.start)
 	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 	recordChatMetric(s, total)
+	recordUsageLog(s, total)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，

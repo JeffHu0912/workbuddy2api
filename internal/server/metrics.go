@@ -12,8 +12,11 @@
 package server
 
 import (
+	"bufio"
+	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -129,6 +132,81 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 	}
 
 	mm.lastSeen = time.Now()
+}
+
+// usageRecord 单条消耗落盘记录（data/usage.jsonl 每行一条）。
+type usageRecord struct {
+	TS          string  `json:"ts"`
+	Model       string  `json:"model"`
+	UID8        string  `json:"uid8"`
+	Credit      float64 `json:"credit"`
+	Prompt      int     `json:"prompt_tokens"`
+	Completion  int     `json:"completion_tokens"`
+	CacheHit    int     `json:"cache_hit_tokens"`
+	CacheMiss   int     `json:"cache_miss_tokens"`
+	CacheWrite  int     `json:"cache_write_tokens"`
+	TTFBMs      int64   `json:"ttfb_ms"`
+	LatencyMs   int64   `json:"latency_ms"`
+	Streaming   bool    `json:"streaming"`
+	Success     bool    `json:"success"`
+}
+
+var usageLogCh = make(chan usageRecord, 1024)
+
+func init() {
+	go usageLogWriter()
+}
+
+// usageLogWriter 异步批量落盘，不阻塞请求路径。
+func usageLogWriter() {
+	f, err := os.OpenFile("data/usage.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("WARN: usage log open failed: %v", err)
+		return
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+	for rec := range usageLogCh {
+		b, _ := json.Marshal(rec)
+		w.Write(b)
+		w.WriteByte('\n')
+		w.Flush() // 每条立即 flush，避免进程崩溃丢数据
+	}
+}
+
+// recordUsageLog 把单次请求观测写入 usage.jsonl（异步，不阻塞）。
+func recordUsageLog(s *chatStat, total time.Duration) {
+	uid8 := s.uid
+	if len(uid8) > 8 {
+		uid8 = uid8[:8]
+	}
+	rec := usageRecord{
+		TS:         time.Now().Format(time.RFC3339),
+		Model:      s.model,
+		UID8:       uid8,
+		Streaming:  s.mode == "stream",
+		Success:    s.status == 200,
+		LatencyMs:  total.Milliseconds(),
+		TTFBMs:     s.ttfb.Milliseconds(),
+	}
+	if s.hasUsage {
+		rec.Prompt = s.prompt
+		if s.toks > 0 {
+			rec.Completion = s.toks
+		}
+		rec.CacheHit = s.cacheHit
+		rec.CacheMiss = s.cacheMiss
+		rec.CacheWrite = s.cacheWr
+	}
+	if s.hasCredit {
+		rec.Credit = s.credit
+	}
+	select {
+	case usageLogCh <- rec:
+	default:
+		// channel 满时丢弃，不阻塞请求路径
+	}
 }
 
 // MetricsSnapshot 是 /v1/stats 的响应载荷（字段名与社区面板约定一致）。
