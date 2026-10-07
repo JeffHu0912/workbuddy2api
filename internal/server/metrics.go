@@ -8,7 +8,8 @@
 //   - **按模型聚合**：模型名含 realm 前缀原样入键（global:xxx 与裸名分开统计）。
 //   - **有界内存**：模型键数量受上游目录限制（不是无界增长）；另设容量上限兜底，
 //     超限时丢弃新键并记一次 WARN，避免异常模型名刷爆内存。
-//   - **零外部依赖**：纯内存累加，进程重启即清零（since 随进程启动时间）。
+//   - **零外部依赖**：聚合表纯内存累加，进程重启即清零（since 随进程启动时间）；
+//     消耗持久化（data/usage.jsonl）由 usageLogWriter 独立异步落盘，不参与聚合。
 package server
 
 import (
@@ -19,6 +20,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -135,60 +137,143 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 }
 
 // usageRecord 单条消耗落盘记录（data/usage.jsonl 每行一条）。
+// 字段与 modelMetrics 同口径，另加 uid8（chatStat.uid 前 8 位，无 uid 留空）。
 type usageRecord struct {
-	TS          string  `json:"ts"`
-	Model       string  `json:"model"`
-	UID8        string  `json:"uid8"`
-	Credit      float64 `json:"credit"`
-	Prompt      int     `json:"prompt_tokens"`
-	Completion  int     `json:"completion_tokens"`
-	CacheHit    int     `json:"cache_hit_tokens"`
-	CacheMiss   int     `json:"cache_miss_tokens"`
-	CacheWrite  int     `json:"cache_write_tokens"`
-	TTFBMs      int64   `json:"ttfb_ms"`
-	LatencyMs   int64   `json:"latency_ms"`
-	Streaming   bool    `json:"streaming"`
-	Success     bool    `json:"success"`
+	TS         string  `json:"ts"`
+	Model      string  `json:"model"`
+	UID8       string  `json:"uid8"`
+	Credit     float64 `json:"credit"`
+	Prompt     int     `json:"prompt_tokens"`
+	Completion int     `json:"completion_tokens"`
+	CacheHit   int     `json:"cache_hit_tokens"`
+	CacheMiss  int     `json:"cache_miss_tokens"`
+	CacheWrite int     `json:"cache_write_tokens"`
+	TTFBMs     int64   `json:"ttfb_ms"`
+	LatencyMs  int64   `json:"latency_ms"`
+	Streaming  bool    `json:"streaming"`
+	Success    bool    `json:"success"`
 }
 
-var usageLogCh = make(chan usageRecord, 1024)
+// 全局消耗落盘状态。usageLogPath 为空 = 未接线（默认关闭）：测试与纯内存形态
+// 完全 no-op，不会在测试 CWD 下创建 data/ 目录。main 启动时用 state_file 同目录
+// 的 usage.jsonl 接线（SetUsageLogPath）。
+var (
+	usageLogMu    sync.Mutex
+	usageLogPath  string
+	usageLogCh    chan usageRecord
+	usageLogStop  chan struct{}
+	usageLogDone  chan struct{}
+	usageLogDrops atomic.Int64 // 队列满丢弃计数（告警节流）
+)
 
-func init() {
-	go usageLogWriter()
-}
-
-// usageLogWriter 异步批量落盘，不阻塞请求路径。
-func usageLogWriter() {
-	f, err := os.OpenFile("data/usage.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("WARN: usage log open failed: %v", err)
+// SetUsageLogPath 接线消耗落盘文件路径；空路径关闭落盘（幂等，默认关闭）。
+// 重复调用先停旧 writer（排空已入队记录再退出），再按新路径重启。
+func SetUsageLogPath(path string) {
+	usageLogMu.Lock()
+	defer usageLogMu.Unlock()
+	if usageLogCh != nil {
+		close(usageLogStop)
+		<-usageLogDone
+		usageLogCh, usageLogStop, usageLogDone = nil, nil, nil
+	}
+	usageLogPath = path
+	usageLogDrops.Store(0)
+	if path == "" {
 		return
 	}
-	defer f.Close()
-	w := bufio.NewWriter(f)
-	defer w.Flush()
-	for rec := range usageLogCh {
-		b, _ := json.Marshal(rec)
-		w.Write(b)
-		w.WriteByte('\n')
-		w.Flush() // 每条立即 flush，避免进程崩溃丢数据
+	usageLogCh = make(chan usageRecord, 1024)
+	usageLogStop = make(chan struct{})
+	usageLogDone = make(chan struct{})
+	go usageLogWriter(path, usageLogCh, usageLogStop, usageLogDone)
+}
+
+// CloseUsageLog 停止消耗落盘：排空队列 → flush → 关文件（进程退出/测试收尾用）。
+func CloseUsageLog() { SetUsageLogPath("") }
+
+// usageLogWriter 单 goroutine 串行落盘：并发安全由 channel 序列化保证，写路径
+// 无锁、请求路径无阻塞。open/写失败只 WARN 不退出，下一条记录重试 open；
+// stop 时排空已入队记录再 flush 关闭，正常退出不丢记录。
+func usageLogWriter(path string, ch chan usageRecord, stop, done chan struct{}) {
+	defer close(done)
+	var f *os.File
+	var w *bufio.Writer
+
+	flush := func() {
+		if w != nil {
+			if err := w.Flush(); err != nil {
+				log.Printf("WARN: [usage] flush %s: %v", path, err)
+			}
+		}
+	}
+	writeLine := func(rec usageRecord) {
+		if f == nil {
+			var err error
+			f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				log.Printf("WARN: [usage] open %s: %v", path, err)
+				return
+			}
+			w = bufio.NewWriterSize(f, 64*1024)
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			log.Printf("WARN: [usage] marshal: %v", err)
+			return
+		}
+		if _, err := w.Write(append(b, '\n')); err != nil {
+			log.Printf("WARN: [usage] write %s: %v", path, err)
+			return
+		}
+		// 队列已排空即 flush：突发成批时一次 flush 覆盖整批，涓流时逐条落盘，
+		// 进程崩溃最多丢最后一条。
+		if len(ch) == 0 {
+			flush()
+		}
+	}
+
+	for {
+		select {
+		case rec := <-ch:
+			writeLine(rec)
+		case <-stop:
+			for {
+				select {
+				case rec := <-ch:
+					writeLine(rec)
+				default:
+					flush()
+					if f != nil {
+						_ = f.Close()
+						f, w = nil, nil
+					}
+					return
+				}
+			}
+		}
 	}
 }
 
-// recordUsageLog 把单次请求观测写入 usage.jsonl（异步，不阻塞）。
+// recordUsageLog 把单次请求观测写入 usage.jsonl（异步，不阻塞请求路径）。
+// 未接线（默认）时 no-op；队列满丢弃并 WARN（首条 + 每千条告警一次，防刷屏）。
 func recordUsageLog(s *chatStat, total time.Duration) {
+	usageLogMu.Lock()
+	ch, path := usageLogCh, usageLogPath
+	usageLogMu.Unlock()
+	if ch == nil {
+		return
+	}
 	uid8 := s.uid
 	if len(uid8) > 8 {
 		uid8 = uid8[:8]
 	}
 	rec := usageRecord{
-		TS:         time.Now().Format(time.RFC3339),
-		Model:      s.model,
-		UID8:       uid8,
-		Streaming:  s.mode == "stream",
-		Success:    s.status == 200,
-		LatencyMs:  total.Milliseconds(),
-		TTFBMs:     s.ttfb.Milliseconds(),
+		TS:        time.Now().Format(time.RFC3339),
+		Model:     s.model,
+		UID8:      uid8,
+		Streaming: s.mode == "stream",
+		Success:   s.status == 200,
+		LatencyMs: total.Milliseconds(),
+		TTFBMs:    s.ttfb.Milliseconds(),
 	}
 	if s.hasUsage {
 		rec.Prompt = s.prompt
@@ -203,9 +288,12 @@ func recordUsageLog(s *chatStat, total time.Duration) {
 		rec.Credit = s.credit
 	}
 	select {
-	case usageLogCh <- rec:
+	case ch <- rec:
 	default:
-		// channel 满时丢弃，不阻塞请求路径
+		n := usageLogDrops.Add(1)
+		if n == 1 || n%1000 == 0 {
+			log.Printf("WARN: [usage] 落盘队列满，已丢弃 %d 条（path=%s）", n, path)
+		}
 	}
 }
 

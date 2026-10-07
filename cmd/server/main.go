@@ -31,6 +31,15 @@ func modelJSONPath(stateFile string) string {
 	return filepath.Join(filepath.Dir(stateFile), "model.json")
 }
 
+// usageJSONPath 由 state.json 路径推导 usage.jsonl 路径（同目录，与 model.json 同风格）：
+// 消耗流水与池状态同处数据卷，供外部 logrotate/账本消费。state 路径为空 → 空 = 不落消耗账。
+func usageJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "usage.jsonl")
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
@@ -61,6 +70,11 @@ func main() {
 	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
 	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+
+	// 消耗流水落盘（data/usage.jsonl，与 state.json 同目录）：异步 channel + 单
+	// goroutine 串行 append，不阻塞请求路径；退出时排空 flush（CloseUsageLog）。
+	server.SetUsageLogPath(usageJSONPath(cfg.StateFile))
+	defer server.CloseUsageLog()
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
